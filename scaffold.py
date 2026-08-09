@@ -98,6 +98,26 @@ def _config_is_real(project_root: Path) -> bool:
     return False
 
 
+def _plugin_components() -> list[PluginComponent]:
+    """PluginComponents built from scaffold_base/plugins.json (no hardcoding).
+
+    Each entry needs id/marketplace/marketplaceSource; version and description
+    are optional and default to 1 and a synthesized label.
+    """
+    components = []
+    for p in load_base_wishlist():
+        components.append(
+            PluginComponent(
+                id=p["id"],
+                version=p.get("version", 1),
+                description=p.get("description", f"{p['id'].split('@')[0]} plugin"),
+                marketplace=p["marketplace"],
+                marketplace_source=p["marketplaceSource"],
+            )
+        )
+    return components
+
+
 def build_registry() -> list:
     """The single iterable registry both install and check walk."""
     return [
@@ -153,20 +173,7 @@ def build_registry() -> list:
                 ("scripts/lint_given.py", "scripts/lint_given.py"),
             ],
         ),
-        PluginComponent(
-            id="caveman@caveman",
-            version=1,
-            description="caveman plugin",
-            marketplace="caveman",
-            marketplace_source="dk-krizanovic/caveman",
-        ),
-        PluginComponent(
-            id="superpowers@claude-plugins-official",
-            version=1,
-            description="superpowers plugin",
-            marketplace="claude-plugins-official",
-            marketplace_source="anthropics/claude-plugins",
-        ),
+        *_plugin_components(),
     ]
 
 
