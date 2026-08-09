@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Editors
+.idea/
+.vscode/
+
+# Scaffold runtime state
+.scaffold/
+tokencost/cost.csv
+tokencost/backfill.log

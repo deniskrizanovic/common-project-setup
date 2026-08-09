@@ -1,0 +1,37 @@
+schema: spec-driven
+
+# Project context (shown to AI when creating artifacts).
+context: |
+  <!-- Replace with this project's real context. This baseline is intentionally
+  filled, not the commented-out template: the scaffold's config-baseline check
+  flags the empty template as unsatisfied. Keep a real context block here. -->
+
+  Purpose: describe what this project does in 1-3 sentences.
+
+  Tech stack:
+  - Language / runtime:
+  - Frameworks / libraries:
+  - Data store:
+  - Testing:
+
+  Conventions:
+  - Validate inputs at boundaries; wrap I/O in error handling and log before
+    re-throwing.
+  - Keep shared domain rules in one module; do not duplicate them.
+  - Use conventional commit messages.
+
+# Per-artifact rules.
+rules:
+  specs:
+    - >-
+      Every `#### Scenario:` MUST be immediately followed by a `> **Tests:**`
+      line citing the test(s) that exercise it, or the literal word `none` when
+      no test exists yet. Silence is not permitted — an absent line is
+      indistinguishable from an overlooked one. Enforced by the `lint:specs`
+      traceability gate over both openspec/specs/** and
+      openspec/changes/*/specs/**.
+    - >-
+      Every `#### Scenario:` MUST contain a `- **GIVEN**` clause describing its
+      initial state; a scenario MUST NOT be a bare WHEN/THEN pair. Enforced by
+      the `lint:given` gate over both openspec/specs/** and
+      openspec/changes/*/specs/**.
