@@ -18,6 +18,8 @@ python3 scaffold.py --project <dir> <command>
 | `check`  | Read-only drift report (MISSING / STALE / MODIFIED / MODIFIED+STALE / OK / EXTRA). Writes nothing. |
 | `install`| Interactive per-component picker: `[i]nstall/update`, `[d]iff`, `[s]kip`. Wires hooks idempotently at the end. |
 | `update [<component>] [--force]` | Applies pending updates. A MODIFIED component is refused unless `--force` is given. |
+| `gen` | Regenerates `scaffold_base/plugins.json` and `skills-lock.json` from `manifest.yaml`. |
+| `drift` | Fails (exit 1) when a committed artifact drifts from `manifest.yaml`. |
 
 `--project` defaults to the current directory.
 
@@ -40,12 +42,37 @@ Two classes behind one registry (`build_registry()` in `scaffold.py`):
 **Plugin components** — reconciled against
 `~/.claude/plugins/installed_plugins.json`, installed via `claude plugin install`:
 
-- `caveman`, `superpowers` (base wishlist in `scaffold_base/plugins.json`).
+- `caveman`, `superpowers` (from the `plugins:` section of `manifest.yaml`).
 
 A project extends/overrides the wishlist via `.scaffold/plugins.json` (same-id
 entries replace the base; new ids extend). EXTRA plugins (installed but not
 wishlisted) are **reported only, never removed**. If the `claude` CLI is absent,
 the exact commands are printed instead of failing the run.
+
+**Skill components** — github-sourced skills reconciled against the project's
+`skills-lock.json`, installed via `npx skills add`:
+
+- `grill-me`, `grill-with-docs`, `improve-codebase-architecture`,
+  `diff-org-changes`, `dk-cosmic-counting-coach`, `gherkin-authoring`
+  (from the `skills:` section of `manifest.yaml`).
+
+A project extends/overrides via `.scaffold/skills.yaml` (a `skills:`-only
+manifest fragment; same-name entries replace the base, new names extend). EXTRA
+skills are **reported only, never removed**. If the `npx skills` CLI is absent,
+the exact commands are printed instead of failing the run.
+
+## Source of truth: `scaffold_base/manifest.yaml`
+
+`manifest.yaml` is the single **hand-edited** file declaring desired components,
+with two typed sections (`plugins:` and `skills:`). `plugins.json` and
+`skills-lock.json` are **generated** from it (`scaffold.py gen`) and committed so
+their diffs are reviewable — never hand-edit those two. `scaffold.py drift`
+fails when a committed artifact falls out of sync with the manifest.
+
+`skillPath`/`computedHash` in `skills-lock.json` depend on the real upstream
+repo content, so `gen` resolves them by shelling out to `npx skills`; when the
+CLI is absent it keeps the existing committed lock. The drift guard therefore
+compares only the manifest-derivable projection (skill name → source repo).
 
 ## Source ref configuration
 

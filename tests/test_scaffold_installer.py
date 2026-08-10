@@ -125,10 +125,11 @@ def test_install_diff_option(project_dir, fake_claude_home, monkeypatch):
     _install(project_dir, "lint-gates", "sha_old")
     (project_dir / "scripts" / "lint_specs.py").write_text("local edit\n", encoding="utf-8")
     monkeypatch.setattr(s, "resolve_source_sha", lambda src: "sha_new")
-    # Skip config-baseline, schema-clone, enforcement-hooks, cost-tracker;
-    # then for the modified lint-gates: diff, then skip. Plugins: skip.
-    answers = iter(["s", "s", "s", "s", "d", "s", "s", "s"])
-    reader = lambda _prompt: next(answers)
+    # Skip config-baseline, schema-clone, enforcement-hooks, cost-tracker; then
+    # for the modified lint-gates: diff, then skip. Everything after (plugins,
+    # skills) defaults to skip, so the sequence is robust to registry growth.
+    answers = iter(["s", "s", "s", "s", "d"])
+    reader = lambda _prompt: next(answers, "s")
     out = io.StringIO()
     s.cmd_install(project_dir, s.build_registry(), reader=reader, out=out)
     assert "--- a/scripts/lint_specs.py" in out.getvalue()

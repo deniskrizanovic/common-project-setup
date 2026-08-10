@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "skills": {
+    "diff-org-changes": {
+      "source": "deniskrizanovic/dk-skills",
+      "sourceType": "github",
+      "skillPath": "diff-org-changes/SKILL.md",
+      "computedHash": "0bd724c82e5d6c5889c9eb4394bd25174a53a7d16f3140c99baab6d95f07fa3d"
+    },
+    "dk-cosmic-counting-coach": {
+      "source": "deniskrizanovic/dk-skills",
+      "sourceType": "github",
+      "skillPath": "dk-cosmic-counting-coach/SKILL.md",
+      "computedHash": "d511a641f8e702570565d043a7ba2421e15d08f7e4d599372a7716bc408e9a56"
+    },
+    "gherkin-authoring": {
+      "source": "deniskrizanovic/dk-skills",
+      "sourceType": "github",
+      "skillPath": "gherkin-authoring/SKILL.md",
+      "computedHash": "e6caf211a1d3cb4a8ce6405c500b1f591fda1a1a910403cacea8825ca49b9122"
+    },
+    "grill-me": {
+      "source": "mattpocock/skills",
+      "sourceType": "github",
+      "skillPath": "skills/productivity/grill-me/SKILL.md",
+      "computedHash": "f361db4e15e6bfd562a9282b1dccda513910a50061f9e838ce017be9c69dde3f"
+    },
+    "grill-with-docs": {
+      "source": "mattpocock/skills",
+      "sourceType": "github",
+      "skillPath": "skills/engineering/grill-with-docs/SKILL.md",
+      "computedHash": "9c460cbd94fd3c63cdef967dbdb6e66ca687103cdc380cd37834e4d10b738f78"
+    },
+    "improve-codebase-architecture": {
+      "source": "mattpocock/skills",
+      "sourceType": "github",
+      "skillPath": "skills/engineering/improve-codebase-architecture/SKILL.md",
+      "computedHash": "bce096b49db40761adb1d5348f064c303fc152e4e50fc3fd81b79df8b6cf137f"
+    }
+  }
+}

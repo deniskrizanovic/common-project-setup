@@ -29,9 +29,11 @@ import difflib
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
@@ -49,9 +51,15 @@ EXTRA = "EXTRA"
 # Where this script and its payloads live (canonical source in the repo).
 REPO_ROOT = Path(__file__).resolve().parent
 TEMPLATES_DIR = REPO_ROOT / "templates"
-BASE_PLUGINS = REPO_ROOT / "scaffold_base" / "plugins.json"
+SCAFFOLD_BASE = REPO_ROOT / "scaffold_base"
+BASE_MANIFEST = SCAFFOLD_BASE / "manifest.yaml"
+BASE_PLUGINS = SCAFFOLD_BASE / "plugins.json"
+BASE_SKILLS_LOCK = SCAFFOLD_BASE / "skills-lock.json"
 
 DEFAULT_SOURCE_REF = "main"
+
+# A skill identifier in the manifest: "owner/repo:skill-path".
+SKILL_ID_RE = re.compile(r"^[^/\s]+/[^/\s:]+:[^\s:]+$")
 
 
 # --------------------------------------------------------------------------- #
@@ -83,6 +91,141 @@ class PluginComponent:
     kind: str = "plugin"
 
 
+@dataclass
+class SkillComponent:
+    """A github-sourced skill reconciled against skills-lock.json via `npx skills`.
+
+    `id` is the manifest identifier "owner/repo:skill-path"; `name` is the last
+    path segment used as the skills-lock.json key and the `--skill` argument;
+    `source` is the "owner/repo" the CLI clones from.
+    """
+
+    id: str
+    version: int
+    description: str
+    source: str
+    name: str
+    kind: str = "skill"
+
+
+# --------------------------------------------------------------------------- #
+# Manifest reader (single source of truth)
+# --------------------------------------------------------------------------- #
+def parse_manifest(text: str) -> dict:
+    """Parse the constrained manifest.yaml into {"plugins": [...], "skills": [...]}.
+
+    Deliberately a small stdlib parser (not PyYAML): scaffold.py runs as a
+    standalone `python3 scaffold.py` with zero third-party dependencies. The
+    manifest format is a fixed, documented shape — two typed top-level sections
+    of list items — so a full YAML engine is unwarranted.
+
+    Supported shape:
+        plugins:
+          - id: name@marketplace
+            source: owner/repo
+        skills:
+          - owner/repo:skill-path
+    """
+    plugins: list[dict] = []
+    skills: list[str] = []
+    section: Optional[str] = None
+    current: Optional[dict] = None
+
+    for raw in text.splitlines():
+        # Strip comments and trailing whitespace; ignore blank lines.
+        line = raw.split("#", 1)[0].rstrip()
+        if not line.strip():
+            continue
+
+        stripped = line.strip()
+        indent = len(line) - len(line.lstrip())
+
+        # Top-level section header: `plugins:` / `skills:` (no indent).
+        # Accepts both a block form (`plugins:`) and an inline empty list
+        # (`plugins: []`); a non-empty inline list is not supported.
+        if indent == 0 and not stripped.startswith("- "):
+            head, sep, rest = stripped.partition(":")
+            if sep == ":" and ":" not in head:
+                key = head.strip()
+                if key not in ("plugins", "skills"):
+                    raise SystemExit(f"manifest.yaml: unknown top-level section '{key}'")
+                rest = rest.strip()
+                if rest not in ("", "[]"):
+                    raise SystemExit(
+                        f"manifest.yaml: section '{key}' must use block list form "
+                        f"or '[]', got: {rest!r}"
+                    )
+                section = key
+                current = None
+                continue
+
+        if section is None:
+            raise SystemExit(f"manifest.yaml: content outside any section: {stripped!r}")
+
+        # List item.
+        if stripped.startswith("- "):
+            item = stripped[2:].strip()
+            if section == "skills":
+                skills.append(item)
+                current = None
+                continue
+            # plugins: item is either "key: value" (inline start of a mapping)
+            current = {}
+            plugins.append(current)
+            k, _, v = item.partition(":")
+            if _ != "":
+                current[k.strip()] = v.strip()
+            continue
+
+        # Continuation of the current plugin mapping (`  key: value`).
+        if section == "plugins" and current is not None and ":" in stripped:
+            k, _, v = stripped.partition(":")
+            current[k.strip()] = v.strip()
+            continue
+
+        raise SystemExit(f"manifest.yaml: could not parse line: {stripped!r}")
+
+    return {"plugins": plugins, "skills": skills}
+
+
+def read_manifest_file(path: Path = BASE_MANIFEST) -> dict:
+    """Read + validate manifest.yaml. Raises SystemExit on any malformed entry."""
+    if not path.is_file():
+        raise SystemExit(f"manifest not found: {path}")
+    data = parse_manifest(path.read_text(encoding="utf-8"))
+
+    for i, p in enumerate(data["plugins"]):
+        pid = p.get("id")
+        src = p.get("source")
+        missing = [k for k, v in (("id", pid), ("source", src)) if not v]
+        if missing:
+            label = f"'{pid}'" if pid else f"entry #{i}"
+            raise SystemExit(
+                f"manifest.yaml: plugin {label} is missing required "
+                f"field(s): {', '.join(missing)}"
+            )
+
+    for s in data["skills"]:
+        if not SKILL_ID_RE.match(s):
+            raise SystemExit(
+                f"manifest.yaml: skill entry {s!r} is not a valid "
+                f"'owner/repo:skill-path' string"
+            )
+
+    return data
+
+
+def skill_name_from_id(skill_id: str) -> str:
+    """The skills-lock.json key / `--skill` name: the last path segment."""
+    path = skill_id.split(":", 1)[1]
+    return path.rstrip("/").split("/")[-1]
+
+
+def skill_source_from_id(skill_id: str) -> str:
+    """The 'owner/repo' the CLI clones from."""
+    return skill_id.split(":", 1)[0]
+
+
 def _config_is_real(project_root: Path) -> bool:
     """True when openspec/config.yaml has a real (uncommented) context block."""
     cfg = project_root / "openspec" / "config.yaml"
@@ -95,6 +238,178 @@ def _config_is_real(project_root: Path) -> bool:
         if stripped.startswith("context:") and not stripped.startswith("#"):
             return True
     return False
+
+
+# --------------------------------------------------------------------------- #
+# Artifact generation (manifest.yaml -> plugins.json + skills-lock.json)
+# --------------------------------------------------------------------------- #
+def generate_plugins_json(manifest: dict) -> dict:
+    """manifest -> the { "plugins": [ { id, marketplace, marketplaceSource } ] }
+    shape that plugins.json consumers (compose_wishlist, classify_plugins) read."""
+    plugins = []
+    for p in manifest["plugins"]:
+        pid = p["id"]
+        src = p["source"]
+        # marketplace is the segment after '@' in the id; existing consumers
+        # only key on id/marketplaceSource, but the field is preserved for
+        # continuity with the prior hand-authored file.
+        marketplace = pid.split("@", 1)[1] if "@" in pid else src
+        plugins.append(
+            {
+                "id": pid,
+                "marketplace": marketplace,
+                "marketplaceSource": src,
+            }
+        )
+    return {"plugins": plugins}
+
+
+def resolve_skill_lock_entry(skill_id: str) -> dict:
+    """Resolve a skill's lock entry (skillPath + computedHash) from its source.
+
+    `skillPath` and `computedHash` depend on the real upstream repo layout and
+    content (e.g. grill-me lives at skills/productivity/grill-me/SKILL.md), so
+    they cannot be derived from the manifest string. This shells out to the
+    `npx skills` CLI to install the skill into a throwaway project and reads
+    back the lock entry it wrote. Raises RuntimeError if the CLI is unavailable
+    or the skill does not resolve.
+    """
+    if not skills_cli_available():
+        raise RuntimeError("npx skills CLI unavailable; cannot resolve skill hashes")
+    name = skill_name_from_id(skill_id)
+    source = skill_source_from_id(skill_id)
+    with tempfile.TemporaryDirectory() as tmp:
+        subprocess.run(
+            ["npx", "--yes", "skills@latest", "add", source,
+             "--skill", name, "--copy", "--yes"],
+            cwd=tmp,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        lock_path = Path(tmp) / "skills-lock.json"
+        if not lock_path.is_file():
+            raise RuntimeError(f"skill {skill_id!r} did not resolve (no lock written)")
+        lock = json.loads(lock_path.read_text(encoding="utf-8"))
+        entry = lock.get("skills", {}).get(name)
+        if entry is None:
+            raise RuntimeError(f"skill {skill_id!r} did not resolve (absent from lock)")
+        return entry
+
+
+def generate_skills_lock(manifest: dict, resolver=resolve_skill_lock_entry) -> dict:
+    """manifest -> skills-lock.json.
+
+    `resolver(skill_id) -> entry` supplies the CLI-derived skillPath/computedHash
+    (injectable for tests). Entries are keyed by skill name and sorted, matching
+    the CLI's on-disk format.
+    """
+    skills: dict[str, dict] = {}
+    for skill_id in manifest["skills"]:
+        name = skill_name_from_id(skill_id)
+        entry = resolver(skill_id)
+        skills[name] = {
+            "source": entry.get("source", skill_source_from_id(skill_id)),
+            "sourceType": entry.get("sourceType", "github"),
+            "skillPath": entry["skillPath"],
+            "computedHash": entry["computedHash"],
+        }
+    return {"version": 1, "skills": dict(sorted(skills.items()))}
+
+
+def _json_text(data: dict) -> str:
+    return json.dumps(data, indent=2) + "\n"
+
+
+# --------------------------------------------------------------------------- #
+# Drift guard (committed artifacts vs manifest)
+# --------------------------------------------------------------------------- #
+def _plugins_projection(plugins_json: dict) -> list[dict]:
+    """The manifest-derivable slice of plugins.json (order-preserving)."""
+    return [
+        {
+            "id": p.get("id"),
+            "marketplace": p.get("marketplace"),
+            "marketplaceSource": p.get("marketplaceSource"),
+        }
+        for p in plugins_json.get("plugins", [])
+    ]
+
+
+def _skills_projection(lock: dict) -> dict:
+    """The manifest-derivable slice of skills-lock.json: name -> source.
+
+    skillPath/computedHash depend on upstream repo content and are not derivable
+    from the manifest alone, so the drift guard compares only what the manifest
+    determines: the set of skill names and their source repo."""
+    return {name: e.get("source") for name, e in lock.get("skills", {}).items()}
+
+
+def check_drift(manifest_path: Path = BASE_MANIFEST) -> list[str]:
+    """Return a list of drift messages (empty when artifacts are in sync).
+
+    plugins.json is compared in full (fully manifest-derivable). skills-lock.json
+    is compared on its manifest-derivable projection (name -> source), since
+    hashes require the upstream repo and would false-positive on a pure re-read.
+    """
+    manifest = read_manifest_file(manifest_path)
+    problems: list[str] = []
+
+    want_plugins = generate_plugins_json(manifest)
+    have_plugins = (
+        json.loads(BASE_PLUGINS.read_text(encoding="utf-8"))
+        if BASE_PLUGINS.is_file()
+        else {}
+    )
+    if want_plugins != have_plugins:
+        problems.append(
+            "scaffold_base/plugins.json is out of sync with manifest.yaml "
+            "(run `python3 scaffold.py gen`)"
+        )
+
+    want_skill_names = {skill_name_from_id(s): skill_source_from_id(s)
+                        for s in manifest["skills"]}
+    have_lock = (
+        json.loads(BASE_SKILLS_LOCK.read_text(encoding="utf-8"))
+        if BASE_SKILLS_LOCK.is_file()
+        else {}
+    )
+    if want_skill_names != _skills_projection(have_lock):
+        problems.append(
+            "scaffold_base/skills-lock.json is out of sync with manifest.yaml "
+            "(run `python3 scaffold.py gen`)"
+        )
+
+    # skillPath/computedHash can't be derived from the manifest, so the
+    # name->source check above can't tell whether a pin is actually valid.
+    # A bad `gen` run (CLI hiccup, empty resolver output) can still write blank
+    # pins that silently pass the sync check. Catch that manifest-independent
+    # corruption here so a broken lock never reads as "in sync".
+    for name in want_skill_names:
+        entry = have_lock.get("skills", {}).get(name)
+        if entry and (not entry.get("skillPath") or not entry.get("computedHash")):
+            problems.append(
+                f"scaffold_base/skills-lock.json: skill {name!r} has an empty "
+                f"skillPath/computedHash pin (re-run `python3 scaffold.py gen`)"
+            )
+
+    return problems
+
+
+def cmd_gen(out=sys.stdout) -> int:
+    """Regenerate committed artifacts from manifest.yaml."""
+    manifest = read_manifest_file()
+    BASE_PLUGINS.write_text(_json_text(generate_plugins_json(manifest)), encoding="utf-8")
+    print(f"wrote {BASE_PLUGINS}", file=out)
+    try:
+        lock = generate_skills_lock(manifest)
+    except RuntimeError as e:
+        print(f"! skills-lock.json not regenerated: {e}", file=out)
+        print("  (kept existing committed lock)", file=out)
+        return 0
+    BASE_SKILLS_LOCK.write_text(_json_text(lock), encoding="utf-8")
+    print(f"wrote {BASE_SKILLS_LOCK}", file=out)
+    return 0
 
 
 def _plugin_components() -> list[PluginComponent]:
@@ -120,6 +435,27 @@ def _plugin_components() -> list[PluginComponent]:
                 version=p.get("version", 1),
                 description=p.get("description", f"{pid.split('@')[0]} plugin"),
                 marketplace_source=src,
+            )
+        )
+    return components
+
+
+def _skill_components() -> list[SkillComponent]:
+    """SkillComponents built from the effective skill wishlist (manifest + none).
+
+    Mirrors _plugin_components. The base wishlist is manifest.yaml's `skills:`;
+    per-project composition happens in compose_skill_wishlist at status time.
+    """
+    components: list[SkillComponent] = []
+    for skill_id in load_base_skill_wishlist():
+        name = skill_name_from_id(skill_id)
+        components.append(
+            SkillComponent(
+                id=skill_id,
+                version=1,
+                description=f"{name} skill ({skill_source_from_id(skill_id)})",
+                source=skill_source_from_id(skill_id),
+                name=name,
             )
         )
     return components
@@ -181,6 +517,7 @@ def build_registry() -> list:
             ],
         ),
         *_plugin_components(),
+        *_skill_components(),
     ]
 
 
@@ -454,12 +791,148 @@ def install_plugin(plugin: dict) -> bool:
 
 
 # --------------------------------------------------------------------------- #
+# Skill reconciliation (github-sourced skills via the `npx skills` CLI)
+# --------------------------------------------------------------------------- #
+def load_base_skill_wishlist() -> list[str]:
+    """The base `skills:` list from manifest.yaml (empty if absent/malformed)."""
+    if not BASE_MANIFEST.is_file():
+        return []
+    try:
+        return read_manifest_file(BASE_MANIFEST)["skills"]
+    except SystemExit:
+        return []
+
+
+def compose_skill_wishlist(project_root: Path) -> list[str]:
+    """Base skill wishlist composed with a per-project override.
+
+    Mirrors compose_wishlist for plugins. The override is `.scaffold/skills.yaml`
+    (a `skills:`-only manifest fragment). Same-name entries replace the base;
+    new names extend. Order: base first, then override-only additions.
+    """
+    by_name: dict[str, str] = {
+        skill_name_from_id(s): s for s in load_base_skill_wishlist()
+    }
+    override = project_root / ".scaffold" / "skills.yaml"
+    if override.is_file():
+        try:
+            entries = parse_manifest(override.read_text(encoding="utf-8"))["skills"]
+            for s in entries:
+                if SKILL_ID_RE.match(s):
+                    by_name[skill_name_from_id(s)] = s
+        except (SystemExit, OSError):
+            pass
+    return list(by_name.values())
+
+
+def read_skills_lock(project_root: Path) -> dict:
+    """The project's skills-lock.json ({"skills": {}} if absent/malformed)."""
+    path = project_root / "skills-lock.json"
+    if not path.is_file():
+        return {"skills": {}}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {"skills": {}}
+    data.setdefault("skills", {})
+    return data
+
+
+def skills_cli_available() -> bool:
+    return shutil.which("npx") is not None
+
+
+def skill_stale_names(
+    project_root: Path, names: list[str], out=sys.stderr
+) -> set[str]:
+    """Names the skills CLI reports as updatable, via `npx skills update --check`.
+
+    The installed CLI has no dedicated staleness command that is stable across
+    versions; this is an injectable seam. On any CLI error or absence, returns
+    an empty set (nothing STALE) so staleness never blocks the run — but a
+    parse/CLI failure is logged rather than swallowed silently, so an
+    unrecognised CLI output shape is visible instead of masquerading as
+    "everything current".
+    """
+    if not skills_cli_available() or not names:
+        return set()
+    try:
+        proc = subprocess.run(
+            ["npx", "--yes", "skills@latest", "update", "--check", "--json"],
+            cwd=project_root,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        data = json.loads(proc.stdout)
+    except (json.JSONDecodeError, OSError, ValueError) as e:
+        print(
+            f"! skill staleness check skipped ({type(e).__name__}); "
+            f"treating all installed skills as current",
+            file=out,
+        )
+        return set()
+    updatable = data.get("updatable") or data.get("outdated") or []
+    reported = {u.get("name") if isinstance(u, dict) else u for u in updatable}
+    return {n for n in names if n in reported}
+
+
+def classify_skills(desired: list[str], lock: dict, stale: Optional[set] = None) -> dict:
+    """Return {name: status} for desired + EXTRA installed-but-not-desired.
+
+    MISSING  : desired skill absent from the lock.
+    STALE    : desired skill present but named in `stale`.
+    OK       : desired skill present and current.
+    EXTRA    : locked skill not in the desired set (never removed).
+    """
+    stale = stale or set()
+    result: dict[str, str] = {}
+    locked = lock.get("skills", {})
+    desired_names = {skill_name_from_id(s) for s in desired}
+    for s in desired:
+        name = skill_name_from_id(s)
+        if name not in locked:
+            result[name] = MISSING
+        elif name in stale:
+            result[name] = STALE
+        else:
+            result[name] = OK
+    for name in locked:
+        if name not in desired_names:
+            result[name] = EXTRA
+    return result
+
+
+def skill_install_commands(skill_id: str) -> list[str]:
+    """The exact command to install/update a skill via the skills CLI."""
+    return [
+        f"npx skills add {skill_source_from_id(skill_id)} "
+        f"--skill {skill_name_from_id(skill_id)} --yes"
+    ]
+
+
+def install_skill(skill_id: str, project_root: Path) -> bool:
+    """Shell out to `npx skills add`. Returns True on success, False if CLI absent."""
+    if not skills_cli_available():
+        return False
+    subprocess.run(
+        ["npx", "--yes", "skills@latest", "add",
+         skill_source_from_id(skill_id), "--skill", skill_name_from_id(skill_id),
+         "--yes"],
+        cwd=project_root,
+        check=False,
+    )
+    return True
+
+
+# --------------------------------------------------------------------------- #
 # Status computation shared by list / check / install
 # --------------------------------------------------------------------------- #
 @dataclass
 class Status:
     file_statuses: dict = field(default_factory=dict)
     plugin_statuses: dict = field(default_factory=dict)
+    skill_statuses: dict = field(default_factory=dict)
     source_sha: Optional[str] = None
     offline: bool = False
 
@@ -480,9 +953,20 @@ def compute_status(project_root: Path, registry: list, *, fetch: bool = True) ->
     desired = compose_wishlist(project_root)
     plugin_statuses = classify_plugins(desired, read_installed_plugins())
 
+    desired_skills = compose_skill_wishlist(project_root)
+    lock = read_skills_lock(project_root)
+    present = [
+        skill_name_from_id(s)
+        for s in desired_skills
+        if skill_name_from_id(s) in lock.get("skills", {})
+    ]
+    stale = skill_stale_names(project_root, present) if fetch else set()
+    skill_statuses = classify_skills(desired_skills, lock, stale)
+
     return Status(
         file_statuses=file_statuses,
         plugin_statuses=plugin_statuses,
+        skill_statuses=skill_statuses,
         source_sha=source_sha,
         offline=offline,
     )
@@ -505,6 +989,16 @@ def cmd_list(project_root: Path, registry: list, out=sys.stdout) -> int:
     for pid, st in status.plugin_statuses.items():
         if st == EXTRA:
             print(f"  [{EXTRA:<14}] {pid}  (plugin, not in wishlist)", file=out)
+    for comp in registry:
+        if isinstance(comp, SkillComponent):
+            st = status.skill_statuses.get(comp.name, MISSING)
+            print(f"  [{st:<14}] {comp.name}  (skill)  — {comp.description}", file=out)
+    desired_skill_names = {
+        c.name for c in registry if isinstance(c, SkillComponent)
+    }
+    for name, st in status.skill_statuses.items():
+        if st == EXTRA and name not in desired_skill_names:
+            print(f"  [{EXTRA:<14}] {name}  (skill, not in wishlist)", file=out)
     return 0
 
 
@@ -523,6 +1017,9 @@ def cmd_check(project_root: Path, registry: list, out=sys.stdout) -> int:
     print("Plugins:", file=out)
     for pid, st in status.plugin_statuses.items():
         print(f"  {st:<14} {pid}", file=out)
+    print("Skills:", file=out)
+    for name, st in status.skill_statuses.items():
+        print(f"  {st:<14} {name}", file=out)
     return 0
 
 
@@ -565,7 +1062,7 @@ def cmd_install(
                 write_manifest(project_root, manifest)
                 print("  installed.", file=out)
                 break
-        else:
+        elif isinstance(comp, PluginComponent):
             st = status.plugin_statuses.get(comp.id, MISSING)
             print(f"\n{comp.id} — {st}: {comp.description}", file=out)
             if st == OK:
@@ -581,6 +1078,19 @@ def cmd_install(
             if not install_plugin(plugin):
                 print("  claude CLI not found. Run these commands manually:", file=out)
                 for cmd in plugin_install_commands(plugin):
+                    print(f"    {cmd}", file=out)
+        else:  # SkillComponent
+            st = status.skill_statuses.get(comp.name, MISSING)
+            print(f"\n{comp.name} — {st}: {comp.description}", file=out)
+            if st == OK:
+                print("  current; skipping.", file=out)
+                continue
+            choice = _prompt("  [i]nstall/update, [s]kip? ", ["i", "s"], reader)
+            if choice == "s":
+                continue
+            if not install_skill(comp.id, project_root):
+                print("  npx skills CLI not found. Run these commands manually:", file=out)
+                for cmd in skill_install_commands(comp.id):
                     print(f"    {cmd}", file=out)
 
     # Wire hooks idempotently once enforcement-hooks/cost-tracker present.
@@ -692,6 +1202,8 @@ def build_parser() -> argparse.ArgumentParser:
     up = sub.add_parser("update")
     up.add_argument("component", nargs="?", default=None)
     up.add_argument("--force", action="store_true")
+    sub.add_parser("gen", help="regenerate plugins.json + skills-lock.json from manifest.yaml")
+    sub.add_parser("drift", help="fail if committed artifacts drift from manifest.yaml")
     return parser
 
 
@@ -708,6 +1220,22 @@ def main(argv: Optional[list[str]] = None) -> int:
         return cmd_install(project_root, registry)
     if args.command == "update":
         return cmd_update(project_root, registry, args.component, args.force)
+    if args.command == "gen":
+        return cmd_gen()
+    if args.command == "drift":
+        problems = check_drift()
+        for p in problems:
+            print(p, file=sys.stderr)
+        # The guard verifies names/sources and that pins are non-empty, but it
+        # does NOT re-hash upstream skill content — a skill whose upstream files
+        # changed still reads as in-sync here. Say so, so a clean drift check is
+        # not mistaken for a verified lock.
+        print(
+            "note: skill content hashes are not re-verified against upstream; "
+            "run `python3 scaffold.py gen` to refresh pins",
+            file=sys.stderr,
+        )
+        return 1 if problems else 0
     return 1
 
 
