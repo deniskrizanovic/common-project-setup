@@ -79,7 +79,6 @@ class PluginComponent:
     id: str
     version: int
     description: str
-    marketplace: str
     marketplace_source: str
     kind: str = "plugin"
 
@@ -101,18 +100,26 @@ def _config_is_real(project_root: Path) -> bool:
 def _plugin_components() -> list[PluginComponent]:
     """PluginComponents built from scaffold_base/plugins.json (no hardcoding).
 
-    Each entry needs id/marketplace/marketplaceSource; version and description
-    are optional and default to 1 and a synthesized label.
+    Each entry needs id/marketplaceSource; version and description are optional
+    and default to 1 and a synthesized label.
     """
-    components = []
-    for p in load_base_wishlist():
+    components: list[PluginComponent] = []
+    for i, p in enumerate(load_base_wishlist()):
+        pid = p.get("id")
+        src = p.get("marketplaceSource")
+        missing = [k for k, v in (("id", pid), ("marketplaceSource", src)) if not v]
+        if missing:
+            label = f"'{pid}'" if pid else f"entry #{i}"
+            raise SystemExit(
+                f"scaffold_base/plugins.json: plugin {label} is missing "
+                f"required field(s): {', '.join(missing)}"
+            )
         components.append(
             PluginComponent(
-                id=p["id"],
+                id=pid,
                 version=p.get("version", 1),
-                description=p.get("description", f"{p['id'].split('@')[0]} plugin"),
-                marketplace=p["marketplace"],
-                marketplace_source=p["marketplaceSource"],
+                description=p.get("description", f"{pid.split('@')[0]} plugin"),
+                marketplace_source=src,
             )
         )
     return components

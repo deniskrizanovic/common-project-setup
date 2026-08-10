@@ -8,7 +8,15 @@ from __future__ import annotations
 import io
 import json
 
+import pytest
+
 import scaffold as s
+
+
+def _patch_base_plugins(tmp_path, monkeypatch, plugins):
+    base = tmp_path / "plugins.json"
+    base.write_text(json.dumps({"plugins": plugins}), encoding="utf-8")
+    monkeypatch.setattr(s, "BASE_PLUGINS", base)
 
 
 def _write_installed(home, plugins):
@@ -108,6 +116,42 @@ def test_cmd_list_shows_installed_plugin_ok(project_dir, fake_claude_home, monke
     assert "[OK" in text
     assert "caveman@caveman" in text
     assert "MISSING         caveman@caveman" not in text
+
+
+def test_plugin_components_synthesizes_optional_defaults(tmp_path, monkeypatch):
+    """version/description are optional -> default to 1 and a synthesized label."""
+    _patch_base_plugins(
+        tmp_path,
+        monkeypatch,
+        [{"id": "caveman@caveman", "marketplaceSource": "dk/caveman"}],
+    )
+    comp = s._plugin_components()[0]
+    assert comp.version == 1
+    assert comp.description == "caveman plugin"
+    assert comp.marketplace_source == "dk/caveman"
+
+
+def test_plugin_components_missing_required_field_raises(tmp_path, monkeypatch):
+    """A required field (marketplaceSource) absent -> clear SystemExit naming it."""
+    _patch_base_plugins(
+        tmp_path, monkeypatch, [{"id": "caveman@caveman"}]
+    )
+    with pytest.raises(SystemExit) as exc:
+        s._plugin_components()
+    msg = str(exc.value)
+    assert "caveman@caveman" in msg
+    assert "marketplaceSource" in msg
+
+
+def test_plugin_components_missing_id_names_entry(tmp_path, monkeypatch):
+    """An entry with no id is identified by index, not a KeyError traceback."""
+    _patch_base_plugins(
+        tmp_path, monkeypatch, [{"marketplaceSource": "dk/x"}]
+    )
+    with pytest.raises(SystemExit) as exc:
+        s._plugin_components()
+    assert "entry #0" in str(exc.value)
+    assert "id" in str(exc.value)
 
 
 def test_install_shells_out(stub_claude_cli):
