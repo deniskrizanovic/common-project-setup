@@ -79,7 +79,6 @@ class PluginComponent:
     id: str
     version: int
     description: str
-    marketplace: str
     marketplace_source: str
     kind: str = "plugin"
 
@@ -96,6 +95,34 @@ def _config_is_real(project_root: Path) -> bool:
         if stripped.startswith("context:") and not stripped.startswith("#"):
             return True
     return False
+
+
+def _plugin_components() -> list[PluginComponent]:
+    """PluginComponents built from scaffold_base/plugins.json (no hardcoding).
+
+    Each entry needs id/marketplaceSource; version and description are optional
+    and default to 1 and a synthesized label.
+    """
+    components: list[PluginComponent] = []
+    for i, p in enumerate(load_base_wishlist()):
+        pid = p.get("id")
+        src = p.get("marketplaceSource")
+        missing = [k for k, v in (("id", pid), ("marketplaceSource", src)) if not v]
+        if missing:
+            label = f"'{pid}'" if pid else f"entry #{i}"
+            raise SystemExit(
+                f"scaffold_base/plugins.json: plugin {label} is missing "
+                f"required field(s): {', '.join(missing)}"
+            )
+        components.append(
+            PluginComponent(
+                id=pid,
+                version=p.get("version", 1),
+                description=p.get("description", f"{pid.split('@')[0]} plugin"),
+                marketplace_source=src,
+            )
+        )
+    return components
 
 
 def build_registry() -> list:
@@ -153,20 +180,7 @@ def build_registry() -> list:
                 ("scripts/lint_given.py", "scripts/lint_given.py"),
             ],
         ),
-        PluginComponent(
-            id="caveman@caveman",
-            version=1,
-            description="caveman plugin",
-            marketplace="caveman",
-            marketplace_source="dk-krizanovic/caveman",
-        ),
-        PluginComponent(
-            id="superpowers@claude-plugins-official",
-            version=1,
-            description="superpowers plugin",
-            marketplace="claude-plugins-official",
-            marketplace_source="anthropics/claude-plugins",
-        ),
+        *_plugin_components(),
     ]
 
 
