@@ -32,6 +32,14 @@ Two classes behind one registry (`build_registry()` in `scaffold.py`):
 
 - `config-baseline` — filled `openspec/config.yaml` (real context + traceability
   rules). The empty commented template is treated as **not satisfied**.
+- `config-interview` — guided fill of `config.yaml`'s `context:` block. During
+  `install` it prompts (Purpose, Language/runtime, Frameworks/libraries, Data
+  store, Testing) via the same injectable reader and rewrites **only** the
+  `context:` block, preserving `rules:`, `schema:`, and comments. Drift is
+  MISSING/OK only (no source hash): **OK** once the template placeholder is gone,
+  **MISSING** while it survives. `install` **always** offers `[i]nterview /
+  [s]kip` — even when OK — so context can be revised on a later run; `check`/
+  `list` classify it MISSING/OK and write nothing.
 - `schema-clone` — local `spec-driven` schema clone with the `> **Tests:**` /
   `- **GIVEN**` instructions and templates.
 - `enforcement-hooks` — `branch_guard.py` (asks on edits to `main`/`master`) and

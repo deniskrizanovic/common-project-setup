@@ -77,6 +77,11 @@ class FileComponent:
     # optional predicate: given project root, is the component satisfied beyond
     # file presence? Used by config-baseline to reject the empty template.
     satisfied: Optional[Callable[[Path], bool]] = None
+    # optional interview callable: given (project_root, reader, out), fill the
+    # component in place instead of copying a template. Used by config-interview.
+    # A filler-bearing component has no tracked source hash: it classifies
+    # MISSING/OK only (via `satisfied`), never STALE/MODIFIED.
+    filler: Optional[Callable[[Path, Callable, object], None]] = None
     kind: str = "file"
 
 
@@ -258,18 +263,154 @@ def skills_add_argv(skill_id: str) -> list[str]:
     ]
 
 
-def _config_is_real(project_root: Path) -> bool:
-    """True when openspec/config.yaml has a real (uncommented) context block."""
+# The placeholder line the template ships in its `context:` block. Its presence
+# marks an un-customized config. Shared by _config_is_real (config-baseline) and
+# _context_is_customized (config-interview) so the two predicates never drift on
+# what "the placeholder" is. If the template's placeholder wording changes, this
+# single constant must change with it.
+CONFIG_CONTEXT_SENTINEL = "describe what this project does in 1-3 sentences"
+
+
+def _config_yaml_text(project_root: Path) -> Optional[str]:
+    """Contents of openspec/config.yaml, or None when absent."""
     cfg = project_root / "openspec" / "config.yaml"
     if not cfg.is_file():
+        return None
+    return cfg.read_text(encoding="utf-8")
+
+
+def _config_is_real(project_root: Path) -> bool:
+    """True when openspec/config.yaml has a real (uncommented) context block.
+
+    Baseline is satisfied by the shipped template even while it still carries the
+    `CONFIG_CONTEXT_SENTINEL` placeholder — baseline only rejects the fully
+    commented-out empty template. Customization is config-interview's concern
+    (see _context_is_customized), which keys off the same sentinel.
+    """
+    text = _config_yaml_text(project_root)
+    if text is None:
         return False
-    text = cfg.read_text(encoding="utf-8")
     for line in text.splitlines():
         stripped = line.strip()
         # An uncommented top-level `context:` key means real content.
         if stripped.startswith("context:") and not stripped.startswith("#"):
             return True
     return False
+
+
+def _context_is_customized(project_root: Path) -> bool:
+    """True when the `context:` block no longer carries the template placeholder.
+
+    config-interview has no tracked source hash, so this predicate is its whole
+    drift model: OK once CONFIG_CONTEXT_SENTINEL is gone, MISSING while it
+    survives.
+    """
+    text = _config_yaml_text(project_root)
+    if text is None:
+        return False
+    return CONFIG_CONTEXT_SENTINEL not in text
+
+
+# The interview fields, in prompt order. Each is (prompt label, answer key).
+CONFIG_INTERVIEW_FIELDS = [
+    ("Purpose (what this project does, 1-3 sentences)", "purpose"),
+    ("Language / runtime", "language"),
+    ("Frameworks / libraries", "frameworks"),
+    ("Data store", "data_store"),
+    ("Testing", "testing"),
+]
+
+# Convention lines carried over verbatim from the template so the interview
+# keeps baseline's project conventions rather than dropping them.
+_CONFIG_DEFAULT_CONVENTIONS = [
+    "Validate inputs at boundaries; wrap I/O in error handling and log before",
+    "  re-throwing.",
+    "Keep shared domain rules in one module; do not duplicate them.",
+    "Use conventional commit messages.",
+]
+
+_CONTEXT_BLOCK_RE = re.compile(r"^(?P<indent>[ \t]*)context:[ \t]*\|[ \t]*$")
+
+
+def _render_context_body(answers: dict) -> list[str]:
+    """The unindented lines of a filled `context:` block from interview answers."""
+    lines = [
+        f"Purpose: {answers.get('purpose', '').strip()}",
+        "",
+        "Tech stack:",
+        f"- Language / runtime: {answers.get('language', '').strip()}",
+        f"- Frameworks / libraries: {answers.get('frameworks', '').strip()}",
+        f"- Data store: {answers.get('data_store', '').strip()}",
+        f"- Testing: {answers.get('testing', '').strip()}",
+        "",
+        "Conventions:",
+    ]
+    for conv in _CONFIG_DEFAULT_CONVENTIONS:
+        lines.append(conv if conv.startswith(" ") else f"- {conv}")
+    return lines
+
+
+def _rewrite_context_block(text: str, body: list[str]) -> str:
+    """Replace only the `context: |` block body, preserving everything else.
+
+    Locates the `context: |` key by line, then treats every following line that
+    is blank or indented deeper than the key as the block's body, stopping at the
+    first non-blank line at or below the key's indentation (e.g. `rules:` or a
+    top-level comment). Replaces that span with `body` re-indented two spaces past
+    the key. Raises ValueError if the block cannot be located unambiguously, so a
+    malformed file is left untouched rather than corrupted.
+    """
+    lines = text.splitlines(keepends=True)
+    starts = [i for i, ln in enumerate(lines) if _CONTEXT_BLOCK_RE.match(ln.rstrip("\n"))]
+    if len(starts) != 1:
+        raise ValueError(
+            f"could not locate a single `context: |` block "
+            f"(found {len(starts)}); leaving openspec/config.yaml untouched"
+        )
+    start = starts[0]
+    key_indent = len(_CONTEXT_BLOCK_RE.match(lines[start].rstrip("\n")).group("indent"))
+
+    # Body spans from the line after the key to the first non-blank line whose
+    # indentation is <= the key's (the next sibling key/comment ends the block).
+    end = start + 1
+    while end < len(lines):
+        raw = lines[end].rstrip("\n")
+        if raw.strip() == "":
+            end += 1
+            continue
+        indent = len(raw) - len(raw.lstrip())
+        if indent <= key_indent:
+            break
+        end += 1
+
+    pad = " " * (key_indent + 2)
+    newline = "\n"
+    rendered = [
+        (pad + line + newline) if line else newline for line in body
+    ]
+    return "".join(lines[: start + 1] + rendered + lines[end:])
+
+
+def _config_interview_filler(project_root: Path, reader=input, out=sys.stdout) -> None:
+    """Prompt for project context and rewrite openspec/config.yaml's block.
+
+    Reads answers through the injectable `reader` (same seam as the picker), so
+    it is deterministic and unit-testable. On a locate failure the file is left
+    untouched and a message is printed.
+    """
+    text = _config_yaml_text(project_root)
+    if text is None:
+        print("  openspec/config.yaml not found; run config-baseline first.", file=out)
+        return
+    answers = {key: reader(f"  {label}: ") for label, key in CONFIG_INTERVIEW_FIELDS}
+    body = _render_context_body(answers)
+    try:
+        new_text = _rewrite_context_block(text, body)
+    except ValueError as e:
+        print(f"  {e}", file=out)
+        return
+    (project_root / "openspec" / "config.yaml").write_text(new_text, encoding="utf-8")
+    print("  context block filled.", file=out)
 
 
 # --------------------------------------------------------------------------- #
@@ -502,6 +643,15 @@ def build_registry() -> list:
             satisfied=_config_is_real,
         ),
         FileComponent(
+            id="config-interview",
+            version=1,
+            description="Guided fill of openspec/config.yaml's context block (MISSING until customized)",
+            # No tracked files: the interview rewrites config.yaml in place.
+            files=[],
+            satisfied=_context_is_customized,
+            filler=_config_interview_filler,
+        ),
+        FileComponent(
             id="schema-clone",
             version=1,
             description="Local spec-driven schema clone with traceability instructions",
@@ -646,6 +796,12 @@ def classify_file_component(
     `source_sha` is None when the source is unreachable (offline): STALE cannot
     be evaluated, so we never return STALE and never claim OK on that basis.
     """
+    # Filler components (config-interview) have no tracked source hash and write
+    # nothing to the manifest: their whole drift model is the satisfied()
+    # predicate — OK when customized, MISSING otherwise. Never STALE/MODIFIED.
+    if comp.filler is not None:
+        return OK if (comp.satisfied and comp.satisfied(project_root)) else MISSING
+
     entry = manifest["components"].get(comp.id)
     dest_paths = [project_root / dest for _, dest in comp.files]
 
@@ -1072,6 +1228,17 @@ def cmd_install(
     source_sha = status.source_sha
 
     for comp in registry:
+        if isinstance(comp, FileComponent) and comp.filler is not None:
+            # Interview-style component: always offer [i]nterview / [s]kip, even
+            # when OK/customized, so the context can be revised on a re-run.
+            st = status.file_statuses[comp.id]
+            label = "customized" if st == OK else st
+            print(f"\n{comp.id} — {label}: {comp.description}", file=out)
+            choice = _prompt("  [i]nterview, [s]kip? ", ["i", "s"], reader)
+            if choice == "s":
+                continue
+            comp.filler(project_root, reader, out)
+            continue
         if isinstance(comp, FileComponent):
             st = status.file_statuses[comp.id]
             print(f"\n{comp.id} — {st}: {comp.description}", file=out)
@@ -1143,7 +1310,9 @@ def cmd_update(
     targets = [
         c
         for c in registry
-        if isinstance(c, FileComponent) and (component is None or c.id == component)
+        if isinstance(c, FileComponent)
+        and c.filler is None  # interview components are install-only, no update
+        and (component is None or c.id == component)
     ]
     if component is not None and not targets:
         print(f"Unknown component: {component}", file=out)
