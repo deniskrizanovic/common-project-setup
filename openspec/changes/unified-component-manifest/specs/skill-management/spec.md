@@ -19,7 +19,7 @@ The script SHALL reconcile the desired skill set against the project's `skills-l
 - **THEN** the script classifies it MISSING and offers to install it
 
 #### Scenario: installed skill stale
-- **WHEN** a wishlisted skill is installed but `npx skills update --check` reports an available update
+- **WHEN** a wishlisted skill is installed but its upstream `computedHash` (re-resolved via the `npx skills` CLI) differs from the hash recorded in `skills-lock.json`
 - **THEN** the script classifies it STALE and offers to update it
 
 #### Scenario: installed skill current

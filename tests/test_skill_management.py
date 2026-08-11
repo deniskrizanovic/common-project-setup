@@ -84,7 +84,11 @@ def test_install_skill_cli_absent_returns_false(no_claude_cli):
 
 def test_skill_install_commands():
     cmds = s.skill_install_commands("mattpocock/skills:grill-me")
-    assert cmds == ["npx skills add mattpocock/skills --skill grill-me --yes"]
+    assert cmds == [
+        "npx --yes skills@latest add mattpocock/skills --skill grill-me --yes"
+    ]
+    # The printed command is exactly the argv install_skill executes.
+    assert cmds[0] == " ".join(s.skills_add_argv("mattpocock/skills:grill-me"))
 
 
 def test_cli_absent_run_prints_commands_and_does_not_fail(
@@ -100,7 +104,7 @@ def test_cli_absent_run_prints_commands_and_does_not_fail(
     text = out.getvalue()
     assert rc == 0
     assert "npx skills CLI not found" in text
-    assert "npx skills add mattpocock/skills --skill grill-me --yes" in text
+    assert "npx --yes skills@latest add mattpocock/skills --skill grill-me --yes" in text
 
 
 # --------------------------------------------------------------------------- #
@@ -113,7 +117,7 @@ def test_one_prompt_per_non_ok_skill(
     _patch_base_manifest(tmp_path, monkeypatch)
     _patch_no_plugins(tmp_path, monkeypatch)
     monkeypatch.setattr(s, "resolve_source_sha", lambda src: None)
-    monkeypatch.setattr(s, "skill_stale_names", lambda root, names: set())
+    monkeypatch.setattr(s, "skill_stale_names", lambda desired, lock: set())
     _write_lock(project_dir, {"grill-me": {"source": "mattpocock/skills"}})
 
     registry = s.build_registry()
@@ -143,7 +147,7 @@ def test_no_batch_install_option(
     _patch_base_manifest(tmp_path, monkeypatch)
     _patch_no_plugins(tmp_path, monkeypatch)
     monkeypatch.setattr(s, "resolve_source_sha", lambda src: None)
-    monkeypatch.setattr(s, "skill_stale_names", lambda root, names: set())
+    monkeypatch.setattr(s, "skill_stale_names", lambda desired, lock: set())
     registry = s.build_registry()
     seen = []
 
@@ -191,3 +195,104 @@ def test_override_replaces_same_name(tmp_path, monkeypatch, project_dir):
     )
     by_name = {s.skill_name_from_id(d): d for d in s.compose_skill_wishlist(project_dir)}
     assert by_name["grill-me"] == "myfork/skills:grill-me"
+
+
+# --------------------------------------------------------------------------- #
+# Skill name-collision guard
+# --------------------------------------------------------------------------- #
+def test_manifest_rejects_colliding_skill_names(tmp_path):
+    """Two distinct ids reducing to the same lock key must be rejected."""
+    import pytest
+
+    m = tmp_path / "manifest.yaml"
+    m.write_text(
+        "plugins: []\n"
+        "skills:\n"
+        "  - ownerA/repo1:foo\n"
+        "  - ownerB/repo2:foo\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(SystemExit) as exc:
+        s.read_manifest_file(m)
+    assert "foo" in str(exc.value)
+
+
+def test_manifest_allows_duplicate_identical_ids(tmp_path):
+    """The same id twice is a harmless duplicate, not a collision."""
+    m = tmp_path / "manifest.yaml"
+    m.write_text(
+        "plugins: []\n"
+        "skills:\n"
+        "  - ownerA/repo1:foo\n"
+        "  - ownerA/repo1:foo\n",
+        encoding="utf-8",
+    )
+    assert s.read_manifest_file(m)["skills"] == [
+        "ownerA/repo1:foo",
+        "ownerA/repo1:foo",
+    ]
+
+
+# --------------------------------------------------------------------------- #
+# Staleness by upstream-hash comparison (CLI has no non-mutating check command)
+# --------------------------------------------------------------------------- #
+def _fake_resolver(hashes):
+    def resolve(skill_id):
+        name = s.skill_name_from_id(skill_id)
+        if name not in hashes:
+            raise RuntimeError(f"unresolvable: {skill_id}")
+        return {"computedHash": hashes[name]}
+    return resolve
+
+
+def test_stale_when_upstream_hash_differs(no_claude_cli, monkeypatch):
+    # Force CLI-available so the function does not early-return.
+    monkeypatch.setattr(s, "skills_cli_available", lambda: True)
+    desired = ["mattpocock/skills:grill-me"]
+    lock = {"skills": {"grill-me": {"computedHash": "old"}}}
+    stale = s.skill_stale_names(
+        desired, lock, resolver=_fake_resolver({"grill-me": "new"})
+    )
+    assert stale == {"grill-me"}
+
+
+def test_not_stale_when_hash_matches(monkeypatch):
+    monkeypatch.setattr(s, "skills_cli_available", lambda: True)
+    desired = ["mattpocock/skills:grill-me"]
+    lock = {"skills": {"grill-me": {"computedHash": "same"}}}
+    stale = s.skill_stale_names(
+        desired, lock, resolver=_fake_resolver({"grill-me": "same"})
+    )
+    assert stale == set()
+
+
+def test_missing_skill_not_stale(monkeypatch):
+    """A desired skill absent from the lock is MISSING, never STALE."""
+    monkeypatch.setattr(s, "skills_cli_available", lambda: True)
+    desired = ["mattpocock/skills:grill-me"]
+    stale = s.skill_stale_names(
+        desired, {"skills": {}}, resolver=_fake_resolver({"grill-me": "x"})
+    )
+    assert stale == set()
+
+
+def test_unresolvable_skill_treated_current_and_logged(monkeypatch):
+    monkeypatch.setattr(s, "skills_cli_available", lambda: True)
+    desired = ["mattpocock/skills:grill-me"]
+    lock = {"skills": {"grill-me": {"computedHash": "old"}}}
+    out = io.StringIO()
+    stale = s.skill_stale_names(
+        desired, lock, resolver=_fake_resolver({}), out=out
+    )
+    assert stale == set()
+    assert "grill-me" in out.getvalue()  # failure is visible, not swallowed
+
+
+def test_stale_check_skipped_when_cli_absent(no_claude_cli, monkeypatch):
+    monkeypatch.setattr(s, "skills_cli_available", lambda: False)
+    desired = ["mattpocock/skills:grill-me"]
+    lock = {"skills": {"grill-me": {"computedHash": "old"}}}
+    # resolver must never be called when the CLI is absent.
+    def boom(_):
+        raise AssertionError("resolver called despite CLI absent")
+    assert s.skill_stale_names(desired, lock, resolver=boom) == set()

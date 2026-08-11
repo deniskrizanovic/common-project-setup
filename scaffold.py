@@ -205,12 +205,23 @@ def read_manifest_file(path: Path = BASE_MANIFEST) -> dict:
                 f"field(s): {', '.join(missing)}"
             )
 
+    seen_names: dict[str, str] = {}
     for s in data["skills"]:
         if not SKILL_ID_RE.match(s):
             raise SystemExit(
                 f"manifest.yaml: skill entry {s!r} is not a valid "
                 f"'owner/repo:skill-path' string"
             )
+        # Two distinct ids that reduce to the same skills-lock.json key would
+        # silently clobber one another during generation. Reject at parse time.
+        name = skill_name_from_id(s)
+        if name in seen_names and seen_names[name] != s:
+            raise SystemExit(
+                f"manifest.yaml: skill name {name!r} is claimed by two "
+                f"entries ({seen_names[name]!r} and {s!r}); skill names must "
+                f"be unique across the manifest"
+            )
+        seen_names[name] = s
 
     return data
 
@@ -224,6 +235,27 @@ def skill_name_from_id(skill_id: str) -> str:
 def skill_source_from_id(skill_id: str) -> str:
     """The 'owner/repo' the CLI clones from."""
     return skill_id.split(":", 1)[0]
+
+
+# The pinned CLI package spec used for every `npx skills` invocation, so the
+# resolver, the installer and the staleness check all run the same version.
+SKILLS_CLI_PKG = "skills@latest"
+
+
+def skills_add_argv(skill_id: str) -> list[str]:
+    """The single canonical `npx skills add` argv used by every call site.
+
+    `--copy` was previously passed only by the hash resolver; the CLI's
+    computedHash is identical with or without it (it only changes whether agent
+    dirs get symlinks or copies), so the flag is dropped to keep the resolved
+    hash and the real install describing the same command.
+    """
+    return [
+        "npx", "--yes", SKILLS_CLI_PKG, "add",
+        skill_source_from_id(skill_id),
+        "--skill", skill_name_from_id(skill_id),
+        "--yes",
+    ]
 
 
 def _config_is_real(project_root: Path) -> bool:
@@ -277,11 +309,9 @@ def resolve_skill_lock_entry(skill_id: str) -> dict:
     if not skills_cli_available():
         raise RuntimeError("npx skills CLI unavailable; cannot resolve skill hashes")
     name = skill_name_from_id(skill_id)
-    source = skill_source_from_id(skill_id)
     with tempfile.TemporaryDirectory() as tmp:
         subprocess.run(
-            ["npx", "--yes", "skills@latest", "add", source,
-             "--skill", name, "--copy", "--yes"],
+            skills_add_argv(skill_id),
             cwd=tmp,
             check=False,
             capture_output=True,
@@ -843,38 +873,46 @@ def skills_cli_available() -> bool:
 
 
 def skill_stale_names(
-    project_root: Path, names: list[str], out=sys.stderr
+    desired: list[str],
+    lock: dict,
+    resolver=resolve_skill_lock_entry,
+    out=sys.stderr,
 ) -> set[str]:
-    """Names the skills CLI reports as updatable, via `npx skills update --check`.
+    """Desired skills whose committed lock hash differs from the upstream hash.
 
-    The installed CLI has no dedicated staleness command that is stable across
-    versions; this is an injectable seam. On any CLI error or absence, returns
-    an empty set (nothing STALE) so staleness never blocks the run — but a
-    parse/CLI failure is logged rather than swallowed silently, so an
-    unrecognised CLI output shape is visible instead of masquerading as
-    "everything current".
+    The installed `npx skills` CLI has no non-mutating staleness command
+    (`update` only ever writes; there is no `--check`/`--json` mode), so
+    staleness is computed directly: re-resolve each desired skill's upstream
+    `computedHash` and compare it to the hash recorded in the project's
+    skills-lock.json. `resolver(skill_id) -> entry` is injectable for tests and
+    matches generate_skills_lock's seam.
+
+    On CLI absence, or any per-skill resolution error, that skill is treated as
+    current (never STALE) so staleness never blocks the run — but a resolution
+    failure is logged rather than swallowed silently, so an unresolvable skill
+    is visible instead of masquerading as "everything current".
     """
-    if not skills_cli_available() or not names:
+    if not skills_cli_available() or not desired:
         return set()
-    try:
-        proc = subprocess.run(
-            ["npx", "--yes", "skills@latest", "update", "--check", "--json"],
-            cwd=project_root,
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        data = json.loads(proc.stdout)
-    except (json.JSONDecodeError, OSError, ValueError) as e:
-        print(
-            f"! skill staleness check skipped ({type(e).__name__}); "
-            f"treating all installed skills as current",
-            file=out,
-        )
-        return set()
-    updatable = data.get("updatable") or data.get("outdated") or []
-    reported = {u.get("name") if isinstance(u, dict) else u for u in updatable}
-    return {n for n in names if n in reported}
+    locked = lock.get("skills", {})
+    stale: set[str] = set()
+    for skill_id in desired:
+        name = skill_name_from_id(skill_id)
+        locked_entry = locked.get(name)
+        if not locked_entry:  # not installed -> MISSING, not STALE
+            continue
+        try:
+            upstream = resolver(skill_id)
+        except (RuntimeError, OSError) as e:
+            print(
+                f"! skill staleness check for {name!r} skipped "
+                f"({type(e).__name__}); treating it as current",
+                file=out,
+            )
+            continue
+        if upstream.get("computedHash") != locked_entry.get("computedHash"):
+            stale.add(name)
+    return stale
 
 
 def classify_skills(desired: list[str], lock: dict, stale: Optional[set] = None) -> dict:
@@ -904,11 +942,11 @@ def classify_skills(desired: list[str], lock: dict, stale: Optional[set] = None)
 
 
 def skill_install_commands(skill_id: str) -> list[str]:
-    """The exact command to install/update a skill via the skills CLI."""
-    return [
-        f"npx skills add {skill_source_from_id(skill_id)} "
-        f"--skill {skill_name_from_id(skill_id)} --yes"
-    ]
+    """The exact command to install/update a skill via the skills CLI.
+
+    A copy-pasteable rendering of the same argv install_skill executes.
+    """
+    return [" ".join(skills_add_argv(skill_id))]
 
 
 def install_skill(skill_id: str, project_root: Path) -> bool:
@@ -916,9 +954,7 @@ def install_skill(skill_id: str, project_root: Path) -> bool:
     if not skills_cli_available():
         return False
     subprocess.run(
-        ["npx", "--yes", "skills@latest", "add",
-         skill_source_from_id(skill_id), "--skill", skill_name_from_id(skill_id),
-         "--yes"],
+        skills_add_argv(skill_id),
         cwd=project_root,
         check=False,
     )
@@ -955,12 +991,7 @@ def compute_status(project_root: Path, registry: list, *, fetch: bool = True) ->
 
     desired_skills = compose_skill_wishlist(project_root)
     lock = read_skills_lock(project_root)
-    present = [
-        skill_name_from_id(s)
-        for s in desired_skills
-        if skill_name_from_id(s) in lock.get("skills", {})
-    ]
-    stale = skill_stale_names(project_root, present) if fetch else set()
+    stale = skill_stale_names(desired_skills, lock) if fetch else set()
     skill_statuses = classify_skills(desired_skills, lock, stale)
 
     return Status(
