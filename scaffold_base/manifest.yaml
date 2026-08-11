@@ -1,0 +1,24 @@
+# Single source of truth for the scaffold's desired components.
+#
+# HAND-EDITED. `plugins.json` and `skills-lock.json` in this directory are
+# GENERATED from this file (run `python3 scaffold.py gen`) and committed so
+# their diffs are reviewable. Never hand-edit those two; edit here instead.
+#
+# Two typed sections:
+#   plugins:  marketplace plugins  -> installed via `claude plugin install`
+#   skills:   github-sourced skills -> installed via `npx skills add`
+
+plugins:
+  - id: caveman@caveman
+    source: dk-krizanovic/caveman
+  - id: superpowers@claude-plugins-official
+    source: anthropics/claude-plugins
+
+# Each skill is an `owner/repo:skill-path` string.
+skills:
+  - mattpocock/skills:grill-me
+  - mattpocock/skills:grill-with-docs
+  - mattpocock/skills:improve-codebase-architecture
+  - deniskrizanovic/dk-skills:diff-org-changes
+  - deniskrizanovic/dk-skills:dk-cosmic-counting-coach
+  - deniskrizanovic/dk-skills:gherkin-authoring

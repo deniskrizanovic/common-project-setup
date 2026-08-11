@@ -170,3 +170,27 @@ def test_cli_absent_prints_commands(no_claude_cli):
         "claude plugin marketplace add dk/caveman",
         "claude plugin install caveman@caveman",
     ]
+
+
+# --------------------------------------------------------------------------- #
+# Generated-plugins.json path: plugins.json is now derived from manifest.yaml
+# --------------------------------------------------------------------------- #
+def test_committed_plugins_json_equals_generator_output():
+    """The committed base plugins.json must equal what the manifest generates."""
+    manifest = s.read_manifest_file()
+    generated = s.generate_plugins_json(manifest)
+    committed = json.loads(s.BASE_PLUGINS.read_text(encoding="utf-8"))
+    assert committed == generated
+
+
+def test_generated_plugins_feed_wishlist_and_registry(project_dir):
+    """Plugins generated from the manifest still drive compose_wishlist/registry.
+
+    The manifest source flows through the same plugins.json consumers untouched:
+    every PluginComponent id is a composed wishlist id."""
+    wishlist_ids = {p["id"] for p in s.compose_wishlist(project_dir)}
+    plugin_ids = {c.id for c in s.build_registry() if isinstance(c, s.PluginComponent)}
+    assert plugin_ids <= wishlist_ids
+    # and those ids match the manifest's plugin ids
+    manifest_ids = {p["id"] for p in s.read_manifest_file()["plugins"]}
+    assert plugin_ids == manifest_ids
