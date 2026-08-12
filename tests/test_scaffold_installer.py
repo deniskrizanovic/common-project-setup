@@ -222,9 +222,82 @@ def test_install_offers_interview_on_ok_component(project_dir, fake_claude_home,
             return next(field_answers)
         if "[i]nterview, [s]kip" in prompt:
             return "i"
+        if "overwrite?" in prompt:  # confirm re-interview over a customized block
+            return "y"
         return "s"
 
     out = io.StringIO()
     s.cmd_install(project_dir, s.build_registry(), reader=reader, out=out)
     assert "config-interview — customized" in out.getvalue()
     assert "Purpose: revised purpose" in cfg.read_text(encoding="utf-8")
+
+
+def test_interview_blank_purpose_aborts(project_dir):
+    """Blank Purpose must not write; sentinel survives so status stays MISSING."""
+    cfg = _write_template_config(project_dir)
+    before = cfg.read_text(encoding="utf-8")
+    out = io.StringIO()
+    # All fields blank (as pressing Enter through the prompts would yield).
+    s._config_interview_filler(project_dir, reader=lambda _p: "", out=out)
+    assert "Purpose is required" in out.getvalue()
+    assert cfg.read_text(encoding="utf-8") == before
+    assert s.CONFIG_CONTEXT_SENTINEL in cfg.read_text(encoding="utf-8")
+    assert not s._context_is_customized(project_dir)
+
+
+def test_interview_reinterview_confirms_before_overwrite(project_dir):
+    """A customized block is preserved when the overwrite confirm is declined."""
+    _write_template_config(project_dir)
+    cfg = project_dir / "openspec" / "config.yaml"
+    seed = iter(["orig purpose", "l", "f", "d", "t"])
+    s._config_interview_filler(project_dir, reader=lambda _p: next(seed), out=io.StringIO())
+    filled = cfg.read_text(encoding="utf-8")
+
+    # Decline the overwrite: block is untouched, field prompts never reached.
+    def reader(prompt):
+        if "overwrite?" in prompt:
+            return "n"
+        raise AssertionError(f"unexpected prompt after decline: {prompt!r}")
+
+    out = io.StringIO()
+    s._config_interview_filler(project_dir, reader=reader, out=out)
+    assert "left unchanged" in out.getvalue()
+    assert cfg.read_text(encoding="utf-8") == filled
+
+
+def test_context_customized_ignores_sentinel_outside_block(project_dir):
+    """The sentinel quoted in rules:/comments doesn't mask a real fill (block-scoped)."""
+    _write_template_config(project_dir)
+    cfg = project_dir / "openspec" / "config.yaml"
+    seed = iter(["real purpose", "l", "f", "d", "t"])
+    s._config_interview_filler(project_dir, reader=lambda _p: next(seed), out=io.StringIO())
+    # Append a comment quoting the placeholder phrase *outside* the context block.
+    text = cfg.read_text(encoding="utf-8")
+    cfg.write_text(text + f"\n# note: do not {s.CONFIG_CONTEXT_SENTINEL}\n", encoding="utf-8")
+    assert s.CONFIG_CONTEXT_SENTINEL in cfg.read_text(encoding="utf-8")
+    assert s._context_is_customized(project_dir)  # still customized: block is clean
+
+
+def test_render_context_body_flattens_multiline_answer():
+    """Embedded newlines collapse to a space so the block scalar stays valid YAML."""
+    body = s._render_context_body({"purpose": "line one\nline two", "language": "py"})
+    assert "Purpose: line one line two" in body
+    assert all("\n" not in line for line in body)
+
+
+def test_update_filler_component_reports_install_only(project_dir):
+    """`update config-interview` is not 'Unknown component' — it's install-only."""
+    out = io.StringIO()
+    rc = s.cmd_update(project_dir, s.build_registry(), component="config-interview", out=out)
+    assert rc == 0
+    msg = out.getvalue()
+    assert "install-only" in msg
+    assert "Unknown component" not in msg
+
+
+def test_update_truly_unknown_component_still_errors(project_dir):
+    """A genuinely unknown id still reports Unknown component with rc=1."""
+    out = io.StringIO()
+    rc = s.cmd_update(project_dir, s.build_registry(), component="nope-nope", out=out)
+    assert rc == 1
+    assert "Unknown component: nope-nope" in out.getvalue()
