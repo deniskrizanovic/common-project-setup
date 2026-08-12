@@ -1,10 +1,13 @@
 # Project-local clone of the built-in `spec-driven` schema.
 # Base version: OpenSpec 1.4.1 (@fission-ai/openspec). Re-diff against the
 # package copy (<package>/schemas/spec-driven/) after any OpenSpec upgrade.
-# Local customisation: the `specs` instruction and templates/spec.md require a
-# `> **Tests:**` traceability line on every scenario (see adopt-openspec-with-test-traceability),
-# and a `- **GIVEN**` clause on every scenario, with the `specs` instruction
-# directing authors to the `gherkin-authoring` skill (see require-given-clauses).
+# Local customisations (re-diff each on upgrade):
+#  1. the `specs` instruction and templates/spec.md require a `> **Tests:**`
+#     traceability line on every scenario (see adopt-openspec-with-test-traceability);
+#  2. a `- **GIVEN**` clause on every scenario, with the `specs` instruction
+#     directing authors to the `gherkin-authoring` skill (see require-given-clauses);
+#  3. the `apply` instruction opens with a once-per-session model-downgrade
+#     prompt (see add-apply-model-downgrade-prompt).
 name: spec-driven
 version: 1
 description: Default OpenSpec workflow - proposal → specs → design → tasks
@@ -161,5 +164,14 @@ apply:
   requires: [tasks]
   tracks: tasks.md
   instruction: |
+    MODEL DOWNGRADE PROMPT (once per apply session, before any task work):
+    Applying tasks is largely mechanical (working a checklist, flipping
+    checkboxes), so a cheaper model usually suffices. Before touching the first
+    task, ask the user whether to downgrade the implementation model (for
+    example Opus to Sonnet). You cannot switch models yourself — tell the user
+    to run `/model` (or `/fast`) to downgrade, then wait for their choice before
+    proceeding. If you have already asked this session, or the user declined, do
+    not prompt again — continue working the task list.
+
     Read context files, work through pending tasks, mark complete as you go.
     Pause if you hit blockers or need clarification.
