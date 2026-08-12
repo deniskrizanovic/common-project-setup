@@ -20,6 +20,12 @@ the per-component picker.
 - **THEN** it prompts at least for Purpose, Language/runtime, Frameworks/libraries, Data store, and Testing
 > **Tests:** none
 
+#### Scenario: a blank field aborts without writing
+- **GIVEN** the `config-interview` step is collecting answers
+- **WHEN** the user leaves any field blank
+- **THEN** the interview writes nothing, reports which fields were blank, and leaves the placeholder sentinel in place so status stays MISSING
+> **Tests:** none
+
 ### Requirement: In-place rewrite preserves the rest of the file
 The interview SHALL rewrite only the `context:` block and SHALL leave the
 `rules:` block, the `schema:` line, and existing comments intact.
@@ -46,6 +52,12 @@ MODIFIED, because the block has no tracked source hash.
 - **GIVEN** a project whose `context:` block still contains the template placeholder sentinel
 - **WHEN** `check` runs against the project
 - **THEN** `config-interview` is classified MISSING and offered for install
+> **Tests:** none
+
+#### Scenario: absent or unlocatable context block reports MISSING
+- **GIVEN** a project whose `openspec/config.yaml` has no locatable `context:` block scalar (deleted, malformed, or duplicated)
+- **WHEN** `check` runs against the project
+- **THEN** `config-interview` is classified MISSING rather than a false OK, because the interview cannot rewrite an unlocatable block
 > **Tests:** none
 
 ### Requirement: Re-run always offers to re-interview

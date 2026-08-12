@@ -317,10 +317,14 @@ def _context_is_customized(project_root: Path, text: Optional[str] = None) -> bo
     if text is None:
         return False
     block = _context_block_text(text)
-    # Unlocatable block (malformed/absent): fall back to a whole-file scan rather
-    # than claim customized — a safe over-report of MISSING.
-    haystack = block if block is not None else text
-    return CONFIG_CONTEXT_SENTINEL not in haystack
+    # Unlocatable block (absent, malformed, or ambiguous): classify MISSING, not
+    # customized. A whole-file scan here would report OK for a file whose context
+    # block was deleted (the sentinel is then absent everywhere), yet the
+    # interview can't rewrite an absent block, so status would be stuck at a false
+    # OK. MISSING is the safe under-claim: install re-offers the interview.
+    if block is None:
+        return False
+    return CONFIG_CONTEXT_SENTINEL not in block
 
 
 # The interview fields, in prompt order. Each is (prompt label, answer key).
@@ -341,7 +345,13 @@ _CONFIG_DEFAULT_CONVENTIONS = [
     "Use conventional commit messages.",
 ]
 
-_CONTEXT_BLOCK_RE = re.compile(r"^(?P<indent>[ \t]*)context:[ \t]*\|[ \t]*$")
+# Matches a `context:` block-scalar key: the `|` literal indicator with optional
+# chomping (`+`/`-`) and explicit-indent digit (`|2`), plus an optional trailing
+# comment. Body re-indentation stays two spaces past the key regardless of an
+# explicit indicator, which the block-boundary scan below tolerates.
+_CONTEXT_BLOCK_RE = re.compile(
+    r"^(?P<indent>[ \t]*)context:[ \t]*\|[+-]?\d*[ \t]*(#.*)?$"
+)
 
 
 def _locate_context_block(text: str):
@@ -441,11 +451,11 @@ def _config_interview_filler(project_root: Path, reader=input, out=sys.stdout) -
     it is deterministic and unit-testable. On a locate failure the file is left
     untouched and a message is printed.
 
-    Guards two ways: a blank Purpose aborts without writing (an all-blank fill
-    would erase the sentinel and falsely classify the component customized), and
-    re-running over an already-customized block confirms before overwriting so a
-    hand-edited context (extra conventions, tweaked tech stack) is not silently
-    discarded.
+    Guards two ways: a blank in any field aborts without writing (a partial fill
+    would erase the sentinel and falsely classify the component customized while
+    leaving fields empty), and re-running over an already-customized block
+    confirms before overwriting so a hand-edited context (extra conventions,
+    tweaked tech stack) is not silently discarded.
     """
     text = _config_yaml_text(project_root)
     if text is None:
@@ -462,8 +472,14 @@ def _config_interview_filler(project_root: Path, reader=input, out=sys.stdout) -
             return
 
     answers = {key: reader(f"  {label}: ") for label, key in CONFIG_INTERVIEW_FIELDS}
-    if not answers.get("purpose", "").strip():
-        print("  Purpose is required; nothing written.", file=out)
+    # Every field is required. A blank in any one clears the sentinel and would
+    # falsely classify the component customized while leaving that field empty, so
+    # abort without writing rather than persist a half-filled block.
+    blank = [label for label, key in CONFIG_INTERVIEW_FIELDS
+             if not answers.get(key, "").strip()]
+    if blank:
+        joined = ", ".join(blank)
+        print(f"  every field is required; blank: {joined}. Nothing written.", file=out)
         return
     body = _render_context_body(answers)
     try:

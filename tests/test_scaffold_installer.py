@@ -233,16 +233,59 @@ def test_install_offers_interview_on_ok_component(project_dir, fake_claude_home,
 
 
 def test_interview_blank_purpose_aborts(project_dir):
-    """Blank Purpose must not write; sentinel survives so status stays MISSING."""
+    """Blank fields must not write; sentinel survives so status stays MISSING."""
     cfg = _write_template_config(project_dir)
     before = cfg.read_text(encoding="utf-8")
     out = io.StringIO()
     # All fields blank (as pressing Enter through the prompts would yield).
     s._config_interview_filler(project_dir, reader=lambda _p: "", out=out)
-    assert "Purpose is required" in out.getvalue()
+    assert "every field is required" in out.getvalue()
     assert cfg.read_text(encoding="utf-8") == before
     assert s.CONFIG_CONTEXT_SENTINEL in cfg.read_text(encoding="utf-8")
     assert not s._context_is_customized(project_dir)
+
+
+def test_interview_blank_non_purpose_field_aborts(project_dir):
+    """A blank in any field (not just Purpose) aborts without writing."""
+    cfg = _write_template_config(project_dir)
+    before = cfg.read_text(encoding="utf-8")
+    out = io.StringIO()
+    # Purpose filled, Data store left blank.
+    answers = iter(["A billing service", "Python", "FastAPI", "", "pytest"])
+    s._config_interview_filler(project_dir, reader=lambda _p: next(answers), out=out)
+    assert "every field is required" in out.getvalue()
+    assert "Data store" in out.getvalue()
+    assert cfg.read_text(encoding="utf-8") == before
+    assert s.CONFIG_CONTEXT_SENTINEL in cfg.read_text(encoding="utf-8")
+    assert not s._context_is_customized(project_dir)
+
+
+def test_context_absent_block_is_missing_not_ok(project_dir, fake_claude_home, monkeypatch):
+    """A config with no context block classifies MISSING, not a false OK (review #1).
+
+    Whole-file sentinel scan would report OK (sentinel absent everywhere), but the
+    interview can't rewrite an absent block, so status must under-claim MISSING.
+    """
+    monkeypatch.setattr(s, "resolve_source_sha", lambda src: None)
+    cfg = project_dir / "openspec" / "config.yaml"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text("schema: spec-driven\nrules:\n  specs: []\n", encoding="utf-8")
+    assert s.CONFIG_CONTEXT_SENTINEL not in cfg.read_text(encoding="utf-8")
+    assert not s._context_is_customized(project_dir)
+    registry = s.build_registry()
+    comp = next(c for c in registry if c.id == "config-interview")
+    manifest = s.read_manifest(project_dir)
+    assert s.classify_file_component(project_dir, comp, manifest, None) == s.MISSING
+
+
+def test_locate_context_block_accepts_scalar_indicators(project_dir):
+    """`|-`, `|+`, `|2`, and a trailing comment on the key are all locatable (review #3)."""
+    for key in ("context: |", "context: |-", "context: |+", "context: |2", "context: |  # notes"):
+        text = f"schema: spec-driven\n{key}\n  Purpose: {s.CONFIG_CONTEXT_SENTINEL}\nrules:\n  specs: []\n"
+        located = s._locate_context_block(text)
+        assert located is not None, f"failed to locate for key {key!r}"
+        _, start, end, _ = located
+        assert (end - start) == 2  # key line + one body line
 
 
 def test_interview_reinterview_confirms_before_overwrite(project_dir):
@@ -293,6 +336,22 @@ def test_update_filler_component_reports_install_only(project_dir):
     msg = out.getvalue()
     assert "install-only" in msg
     assert "Unknown component" not in msg
+
+
+def test_compute_status_reads_config_once(project_dir, fake_claude_home, monkeypatch):
+    """compute_status reads config.yaml once, shared by both config predicates (review #6)."""
+    monkeypatch.setattr(s, "resolve_source_sha", lambda src: None)
+    _write_template_config(project_dir)
+    calls = {"n": 0}
+    real = s._config_yaml_text
+
+    def counting(project_root):
+        calls["n"] += 1
+        return real(project_root)
+
+    monkeypatch.setattr(s, "_config_yaml_text", counting)
+    s.compute_status(project_dir, s.build_registry(), fetch=False)
+    assert calls["n"] == 1
 
 
 def test_update_truly_unknown_component_still_errors(project_dir):
