@@ -98,7 +98,7 @@ def test_cli_absent_run_prints_commands_and_does_not_fail(
     _patch_no_plugins(tmp_path, monkeypatch)
     monkeypatch.setattr(s, "resolve_source_sha", lambda src: None)
     registry = s.build_registry()
-    answers = iter(["i"] * 10)  # accept everything offered
+    answers = iter(["i"] * 50)  # accept everything offered (incl. interview fields)
     out = io.StringIO()
     rc = s.cmd_install(project_dir, registry, reader=lambda p: next(answers), out=out)
     text = out.getvalue()
@@ -159,9 +159,15 @@ def test_no_batch_install_option(
     # Skill/plugin prompts are exactly the per-item two-option form; no batch.
     skill_prompts = [p for p in seen if p == "  [i]nstall/update, [s]kip? "]
     file_prompts = [p for p in seen if p == "  [i]nstall/update, [d]iff, [s]kip? "]
+    interview_prompts = [p for p in seen if p == "  [i]nterview, [s]kip? "]
     assert skill_prompts  # skills did prompt
-    # every prompt is one of the two known per-item forms; none offer a batch/all
-    assert set(seen) <= {skill_prompts[0], *( [file_prompts[0]] if file_prompts else [] )}
+    # every prompt is one of the known per-item forms; none offer a batch/all
+    known = {
+        *([skill_prompts[0]] if skill_prompts else []),
+        *([file_prompts[0]] if file_prompts else []),
+        *([interview_prompts[0]] if interview_prompts else []),
+    }
+    assert set(seen) <= known
     for p in seen:
         assert "batch" not in p.lower()
 

@@ -125,11 +125,238 @@ def test_install_diff_option(project_dir, fake_claude_home, monkeypatch):
     _install(project_dir, "lint-gates", "sha_old")
     (project_dir / "scripts" / "lint_specs.py").write_text("local edit\n", encoding="utf-8")
     monkeypatch.setattr(s, "resolve_source_sha", lambda src: "sha_new")
-    # Skip config-baseline, schema-clone, enforcement-hooks, cost-tracker; then
-    # for the modified lint-gates: diff, then skip. Everything after (plugins,
-    # skills) defaults to skip, so the sequence is robust to registry growth.
-    answers = iter(["s", "s", "s", "s", "d"])
+    # Skip config-baseline, config-interview, schema-clone, enforcement-hooks,
+    # cost-tracker; then for the modified lint-gates: diff, then skip. Everything
+    # after (plugins, skills) defaults to skip, robust to registry growth.
+    answers = iter(["s", "s", "s", "s", "s", "d"])
     reader = lambda _prompt: next(answers, "s")
     out = io.StringIO()
     s.cmd_install(project_dir, s.build_registry(), reader=reader, out=out)
     assert "--- a/scripts/lint_specs.py" in out.getvalue()
+
+
+# --------------------------------------------------------------------------- #
+# config-interview
+# --------------------------------------------------------------------------- #
+def _write_template_config(project_dir):
+    """Copy the shipped template config (with its placeholder) into the project."""
+    cfg = project_dir / "openspec" / "config.yaml"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    src = s.TEMPLATES_DIR / "openspec" / "config.yaml"
+    cfg.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+    return cfg
+
+
+def test_interview_fills_block_and_clears_sentinel(project_dir):
+    """Scripted answers fill the context block; the sentinel is gone (2.3)."""
+    cfg = _write_template_config(project_dir)
+    assert s.CONFIG_CONTEXT_SENTINEL in cfg.read_text(encoding="utf-8")
+    answers = iter(["A billing service", "Python 3.12", "FastAPI", "Postgres", "pytest"])
+    reader = lambda _prompt: next(answers)
+    out = io.StringIO()
+    s._config_interview_filler(project_dir, reader=reader, out=out)
+    text = cfg.read_text(encoding="utf-8")
+    assert s.CONFIG_CONTEXT_SENTINEL not in text
+    assert "Purpose: A billing service" in text
+    assert "Language / runtime: Python 3.12" in text
+    assert "Frameworks / libraries: FastAPI" in text
+    assert "Data store: Postgres" in text
+    assert "Testing: pytest" in text
+
+
+def test_interview_preserves_rules_schema_comments(project_dir):
+    """rules:, schema:, and comments survive the rewrite (2.5)."""
+    cfg = _write_template_config(project_dir)
+    answers = iter(["p", "l", "f", "d", "t"])
+    reader = lambda _prompt: next(answers)
+    s._config_interview_filler(project_dir, reader=reader, out=io.StringIO())
+    text = cfg.read_text(encoding="utf-8")
+    assert text.startswith("schema: spec-driven")
+    assert "# Per-artifact rules." in text
+    assert "rules:" in text
+    assert "specs:" in text
+    # The `> **Tests:**` traceability rule text is part of the rules: block.
+    assert "traceability gate" in text
+
+
+def test_interview_missing_config_is_noop(project_dir):
+    """No config on disk -> filler prints and writes nothing."""
+    out = io.StringIO()
+    s._config_interview_filler(project_dir, reader=lambda _p: "x", out=out)
+    assert "not found" in out.getvalue()
+    assert not (project_dir / "openspec" / "config.yaml").exists()
+
+
+def test_interview_drift_missing_then_ok(project_dir, fake_claude_home, monkeypatch):
+    """Placeholder -> MISSING; customized -> OK (3.4)."""
+    monkeypatch.setattr(s, "resolve_source_sha", lambda src: None)
+    _write_template_config(project_dir)
+    registry = s.build_registry()
+    comp = next(c for c in registry if c.id == "config-interview")
+    manifest = s.read_manifest(project_dir)
+    assert s.classify_file_component(project_dir, comp, manifest, None) == s.MISSING
+    answers = iter(["p", "l", "f", "d", "t"])
+    s._config_interview_filler(project_dir, reader=lambda _p: next(answers), out=io.StringIO())
+    assert s.classify_file_component(project_dir, comp, manifest, None) == s.OK
+
+
+def test_install_offers_interview_on_ok_component(project_dir, fake_claude_home, monkeypatch):
+    """Even customized (OK), install re-offers the interview (3.4)."""
+    monkeypatch.setattr(s, "resolve_source_sha", lambda src: None)
+    _write_template_config(project_dir)
+    # First fill so config-interview classifies OK.
+    seed = iter(["orig", "l", "f", "d", "t"])
+    s._config_interview_filler(project_dir, reader=lambda _p: next(seed), out=io.StringIO())
+    cfg = project_dir / "openspec" / "config.yaml"
+    assert s._context_is_customized(project_dir)
+
+    # Re-run install: interview the OK component and change the purpose.
+    # Reader yields answers when prompted with "  <label>: " and menu choices
+    # otherwise; config-interview is offered despite being OK ("customized").
+    field_answers = iter(["revised purpose", "l2", "f2", "d2", "t2"])
+
+    def reader(prompt):
+        if prompt.strip().startswith("Purpose") or prompt.strip().rstrip(":") in (
+            "Language / runtime", "Frameworks / libraries", "Data store", "Testing",
+        ):
+            return next(field_answers)
+        if "[i]nterview, [s]kip" in prompt:
+            return "i"
+        if "overwrite?" in prompt:  # confirm re-interview over a customized block
+            return "y"
+        return "s"
+
+    out = io.StringIO()
+    s.cmd_install(project_dir, s.build_registry(), reader=reader, out=out)
+    assert "config-interview — customized" in out.getvalue()
+    assert "Purpose: revised purpose" in cfg.read_text(encoding="utf-8")
+
+
+def test_interview_blank_purpose_aborts(project_dir):
+    """Blank fields must not write; sentinel survives so status stays MISSING."""
+    cfg = _write_template_config(project_dir)
+    before = cfg.read_text(encoding="utf-8")
+    out = io.StringIO()
+    # All fields blank (as pressing Enter through the prompts would yield).
+    s._config_interview_filler(project_dir, reader=lambda _p: "", out=out)
+    assert "every field is required" in out.getvalue()
+    assert cfg.read_text(encoding="utf-8") == before
+    assert s.CONFIG_CONTEXT_SENTINEL in cfg.read_text(encoding="utf-8")
+    assert not s._context_is_customized(project_dir)
+
+
+def test_interview_blank_non_purpose_field_aborts(project_dir):
+    """A blank in any field (not just Purpose) aborts without writing."""
+    cfg = _write_template_config(project_dir)
+    before = cfg.read_text(encoding="utf-8")
+    out = io.StringIO()
+    # Purpose filled, Data store left blank.
+    answers = iter(["A billing service", "Python", "FastAPI", "", "pytest"])
+    s._config_interview_filler(project_dir, reader=lambda _p: next(answers), out=out)
+    assert "every field is required" in out.getvalue()
+    assert "Data store" in out.getvalue()
+    assert cfg.read_text(encoding="utf-8") == before
+    assert s.CONFIG_CONTEXT_SENTINEL in cfg.read_text(encoding="utf-8")
+    assert not s._context_is_customized(project_dir)
+
+
+def test_context_absent_block_is_missing_not_ok(project_dir, fake_claude_home, monkeypatch):
+    """A config with no context block classifies MISSING, not a false OK (review #1).
+
+    Whole-file sentinel scan would report OK (sentinel absent everywhere), but the
+    interview can't rewrite an absent block, so status must under-claim MISSING.
+    """
+    monkeypatch.setattr(s, "resolve_source_sha", lambda src: None)
+    cfg = project_dir / "openspec" / "config.yaml"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text("schema: spec-driven\nrules:\n  specs: []\n", encoding="utf-8")
+    assert s.CONFIG_CONTEXT_SENTINEL not in cfg.read_text(encoding="utf-8")
+    assert not s._context_is_customized(project_dir)
+    registry = s.build_registry()
+    comp = next(c for c in registry if c.id == "config-interview")
+    manifest = s.read_manifest(project_dir)
+    assert s.classify_file_component(project_dir, comp, manifest, None) == s.MISSING
+
+
+def test_locate_context_block_accepts_scalar_indicators(project_dir):
+    """`|-`, `|+`, `|2`, and a trailing comment on the key are all locatable (review #3)."""
+    for key in ("context: |", "context: |-", "context: |+", "context: |2", "context: |  # notes"):
+        text = f"schema: spec-driven\n{key}\n  Purpose: {s.CONFIG_CONTEXT_SENTINEL}\nrules:\n  specs: []\n"
+        located = s._locate_context_block(text)
+        assert located is not None, f"failed to locate for key {key!r}"
+        _, start, end, _ = located
+        assert (end - start) == 2  # key line + one body line
+
+
+def test_interview_reinterview_confirms_before_overwrite(project_dir):
+    """A customized block is preserved when the overwrite confirm is declined."""
+    _write_template_config(project_dir)
+    cfg = project_dir / "openspec" / "config.yaml"
+    seed = iter(["orig purpose", "l", "f", "d", "t"])
+    s._config_interview_filler(project_dir, reader=lambda _p: next(seed), out=io.StringIO())
+    filled = cfg.read_text(encoding="utf-8")
+
+    # Decline the overwrite: block is untouched, field prompts never reached.
+    def reader(prompt):
+        if "overwrite?" in prompt:
+            return "n"
+        raise AssertionError(f"unexpected prompt after decline: {prompt!r}")
+
+    out = io.StringIO()
+    s._config_interview_filler(project_dir, reader=reader, out=out)
+    assert "left unchanged" in out.getvalue()
+    assert cfg.read_text(encoding="utf-8") == filled
+
+
+def test_context_customized_ignores_sentinel_outside_block(project_dir):
+    """The sentinel quoted in rules:/comments doesn't mask a real fill (block-scoped)."""
+    _write_template_config(project_dir)
+    cfg = project_dir / "openspec" / "config.yaml"
+    seed = iter(["real purpose", "l", "f", "d", "t"])
+    s._config_interview_filler(project_dir, reader=lambda _p: next(seed), out=io.StringIO())
+    # Append a comment quoting the placeholder phrase *outside* the context block.
+    text = cfg.read_text(encoding="utf-8")
+    cfg.write_text(text + f"\n# note: do not {s.CONFIG_CONTEXT_SENTINEL}\n", encoding="utf-8")
+    assert s.CONFIG_CONTEXT_SENTINEL in cfg.read_text(encoding="utf-8")
+    assert s._context_is_customized(project_dir)  # still customized: block is clean
+
+
+def test_render_context_body_flattens_multiline_answer():
+    """Embedded newlines collapse to a space so the block scalar stays valid YAML."""
+    body = s._render_context_body({"purpose": "line one\nline two", "language": "py"})
+    assert "Purpose: line one line two" in body
+    assert all("\n" not in line for line in body)
+
+
+def test_update_filler_component_reports_install_only(project_dir):
+    """`update config-interview` is not 'Unknown component' — it's install-only."""
+    out = io.StringIO()
+    rc = s.cmd_update(project_dir, s.build_registry(), component="config-interview", out=out)
+    assert rc == 0
+    msg = out.getvalue()
+    assert "install-only" in msg
+    assert "Unknown component" not in msg
+
+
+def test_compute_status_reads_config_once(project_dir, fake_claude_home, monkeypatch):
+    """compute_status reads config.yaml once, shared by both config predicates (review #6)."""
+    monkeypatch.setattr(s, "resolve_source_sha", lambda src: None)
+    _write_template_config(project_dir)
+    calls = {"n": 0}
+    real = s._config_yaml_text
+
+    def counting(project_root):
+        calls["n"] += 1
+        return real(project_root)
+
+    monkeypatch.setattr(s, "_config_yaml_text", counting)
+    s.compute_status(project_dir, s.build_registry(), fetch=False)
+    assert calls["n"] == 1
+
+
+def test_update_truly_unknown_component_still_errors(project_dir):
+    """A genuinely unknown id still reports Unknown component with rc=1."""
+    out = io.StringIO()
+    rc = s.cmd_update(project_dir, s.build_registry(), component="nope-nope", out=out)
+    assert rc == 1
+    assert "Unknown component: nope-nope" in out.getvalue()
