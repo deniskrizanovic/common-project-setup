@@ -876,54 +876,32 @@ def resolve_source_sha(source: dict) -> Optional[str]:
 # OpenSpec initialization probe
 # --------------------------------------------------------------------------- #
 def openspec_initialized(project_root: Path) -> bool:
-    """True only when `openspec list --json` reports a root AT `project_root`.
+    """True only when `openspec init` has really run at `project_root`.
 
     The scaffold's OpenSpec-dependent components (config-baseline,
     config-interview, schema-clone) write inside `openspec/`. Installing them
-    on a repo that never ran `openspec init` fabricates a partial tree the CLI
-    does not recognize as a root.
+    on a repo that never ran `openspec init` fabricates a partial tree.
 
-    A non-null `.root` is NOT sufficient: `openspec list --json` walks UP the
-    directory tree to the nearest ancestor root and reports it with
-    `"source": "nearest"`. A project nested under an already-initialized parent
-    would inherit that ancestor's root and pass the gate despite never running
-    `openspec init` itself. The discriminator is therefore the root PATH: it
-    must resolve to `project_root`, not merely be present.
+    The discriminator is the on-disk `openspec/changes/` directory, which
+    `openspec init` always creates and the CLI itself keys detection on ("No
+    OpenSpec changes directory found. Run 'openspec init' first."). We check
+    disk directly rather than shelling out to `openspec list --json` because
+    that command's `root` reporting is unreliable across CLI versions:
 
-    Fails closed — a missing `openspec` CLI, non-zero exit, timeout,
-    unparseable output, an absent/null root, or a root anchored at an ancestor
-    all return False so the gate blocks rather than fabricating a tree.
+    - v1.4.x errors (exit 1) on an uninitialized dir.
+    - v1.8.x reports `root: {path: <cwd>, source: "implicit"}` (exit 0) for ANY
+      directory, even an empty one with no `openspec/` at all.
+
+    So a version-skewed machine (multiple `openspec` binaries on PATH) would
+    pass the gate on an uninitialized repo. The scaffold's own
+    `config-baseline` writes `openspec/config.yaml` but NOT `changes/`, so
+    keying on `config.yaml` would also self-satisfy after a partial run. The
+    `changes/` directory is the only marker that means a real init happened.
+
+    Fails closed — absent `openspec/` or absent `openspec/changes/` returns
+    False so the gate blocks rather than fabricating a tree.
     """
-    if shutil.which("openspec") is None:
-        return False
-    try:
-        proc = subprocess.run(
-            ["openspec", "list", "--json"],
-            cwd=str(project_root),
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return False
-    if proc.returncode != 0:
-        return False
-    try:
-        data = json.loads(proc.stdout)
-    except (json.JSONDecodeError, ValueError):
-        return False
-    root = data.get("root")
-    if root is None:
-        return False
-    # `root` is a dict (`{"path": ..., "source": ...}`) on current CLIs; tolerate
-    # a bare string path from older/other shapes.
-    root_path = root.get("path") if isinstance(root, dict) else root
-    if not isinstance(root_path, str) or not root_path:
-        return False
-    try:
-        return Path(root_path).resolve() == project_root.resolve()
-    except OSError:
-        return False
+    return (project_root / "openspec" / "changes").is_dir()
 
 
 # --------------------------------------------------------------------------- #

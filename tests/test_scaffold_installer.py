@@ -6,7 +6,6 @@ nothing, MODIFIED update refused without --force, present component skipped.
 from __future__ import annotations
 
 import io
-import json
 
 import pytest
 
@@ -369,82 +368,40 @@ def test_update_truly_unknown_component_still_errors(project_dir):
 OPENSPEC_COMPONENTS = ("config-baseline", "config-interview", "schema-clone")
 
 
-class _FakeProc:
-    def __init__(self, returncode, stdout):
-        self.returncode = returncode
-        self.stdout = stdout
-
-
-def test_openspec_initialized_true_on_root_at_project(project_dir, monkeypatch):
-    """A `.root.path` resolving to project_root → True (4.1)."""
-    monkeypatch.setattr(s.shutil, "which", lambda name: "/usr/bin/openspec")
-    payload = json.dumps(
-        {"root": {"path": str(project_dir), "source": "nearest"}, "changes": []}
-    )
-    monkeypatch.setattr(s.subprocess, "run", lambda *a, **k: _FakeProc(0, payload))
+def test_openspec_initialized_true_when_changes_dir_exists(project_dir):
+    """`openspec/changes/` present (real `openspec init`) → True (4.1)."""
+    (project_dir / "openspec" / "changes").mkdir(parents=True)
     assert s.openspec_initialized(project_dir) is True
 
 
-def test_openspec_initialized_true_on_bare_string_root(project_dir, monkeypatch):
-    """Tolerate an older bare-string `.root` equal to project_root → True."""
-    monkeypatch.setattr(s.shutil, "which", lambda name: "/usr/bin/openspec")
-    payload = json.dumps({"root": str(project_dir), "changes": []})
-    monkeypatch.setattr(s.subprocess, "run", lambda *a, **k: _FakeProc(0, payload))
-    assert s.openspec_initialized(project_dir) is True
+def test_openspec_initialized_false_on_empty_project(project_dir):
+    """No `openspec/` at all → False (4.1)."""
+    assert s.openspec_initialized(project_dir) is False
 
 
-def test_openspec_initialized_false_on_ancestor_root(project_dir, monkeypatch):
-    """A root anchored at an ANCESTOR (`source: nearest`) → False (leak guard).
+def test_openspec_initialized_false_on_config_only(project_dir):
+    """`openspec/config.yaml` but no `changes/` (partial scaffold run) → False.
 
-    `openspec list --json` walks up to the nearest ancestor root; a project
-    nested under an initialized parent must NOT pass the gate.
+    The scaffold's own config-baseline writes config.yaml; that must NOT
+    self-satisfy the gate. Only a real init's `changes/` dir counts.
     """
-    monkeypatch.setattr(s.shutil, "which", lambda name: "/usr/bin/openspec")
-    payload = json.dumps(
-        {"root": {"path": str(project_dir.parent), "source": "nearest"}}
-    )
-    monkeypatch.setattr(s.subprocess, "run", lambda *a, **k: _FakeProc(0, payload))
+    (project_dir / "openspec").mkdir()
+    (project_dir / "openspec" / "config.yaml").write_text("schema: spec-driven\n")
     assert s.openspec_initialized(project_dir) is False
 
 
-def test_openspec_initialized_false_on_null_root(project_dir, monkeypatch):
-    """A null `.root` → False (4.1)."""
-    monkeypatch.setattr(s.shutil, "which", lambda name: "/usr/bin/openspec")
-    monkeypatch.setattr(
-        s.subprocess, "run",
-        lambda *a, **k: _FakeProc(0, '{"root": null}'),
-    )
-    assert s.openspec_initialized(project_dir) is False
+def test_openspec_initialized_ignores_cli_and_ancestor(project_dir, monkeypatch):
+    """Disk-based: never shells out, and an initialized ANCESTOR does not leak.
 
-
-def test_openspec_initialized_false_when_cli_missing(project_dir, monkeypatch):
-    """A missing `openspec` CLI → False, without shelling out (4.1)."""
-    monkeypatch.setattr(s.shutil, "which", lambda name: None)
-
+    Guards the version-skew bug where `openspec list --json` (v1.8.x) reports
+    the cwd as root for any directory. The probe must read disk, not the CLI.
+    """
     def boom(*a, **k):
-        raise AssertionError("must not shell out when CLI is absent")
+        raise AssertionError("openspec_initialized must not shell out")
 
     monkeypatch.setattr(s.subprocess, "run", boom)
-    assert s.openspec_initialized(project_dir) is False
-
-
-def test_openspec_initialized_false_on_bad_json(project_dir, monkeypatch):
-    """Unparseable output → False (4.1)."""
-    monkeypatch.setattr(s.shutil, "which", lambda name: "/usr/bin/openspec")
-    monkeypatch.setattr(
-        s.subprocess, "run",
-        lambda *a, **k: _FakeProc(0, "not json at all"),
-    )
-    assert s.openspec_initialized(project_dir) is False
-
-
-def test_openspec_initialized_false_on_nonzero_exit(project_dir, monkeypatch):
-    """A non-zero exit → False (4.1)."""
-    monkeypatch.setattr(s.shutil, "which", lambda name: "/usr/bin/openspec")
-    monkeypatch.setattr(
-        s.subprocess, "run",
-        lambda *a, **k: _FakeProc(1, ""),
-    )
+    # An initialized parent must not make an uninitialized child pass.
+    (project_dir.parent / "openspec" / "changes").mkdir(parents=True, exist_ok=True)
     assert s.openspec_initialized(project_dir) is False
 
 
