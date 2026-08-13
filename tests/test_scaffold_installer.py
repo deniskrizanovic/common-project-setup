@@ -6,6 +6,7 @@ nothing, MODIFIED update refused without --force, present component skipped.
 from __future__ import annotations
 
 import io
+import subprocess
 
 import pytest
 
@@ -436,9 +437,13 @@ def test_install_installs_independent_components_without_root(
     normally (MISSING here) — install writes them on a plain `i`.
     """
     monkeypatch.setattr(s, "resolve_source_sha", lambda src: "sha1")
-    # Keep the run hermetic: no real plugin/skill CLI shell-outs.
+    # Keep the run hermetic: no real plugin/skill CLI shell-outs, and treat
+    # `pnpm` as present so cost-tracker is not BLOCKED by the runtime probe;
+    # stub the ccusage provision so nothing installs globally.
     monkeypatch.setattr(s, "install_plugin", lambda plugin: True)
     monkeypatch.setattr(s, "install_skill", lambda skill_id, project_root: True)
+    monkeypatch.setattr(s, "pnpm_available", lambda project_root: True)
+    monkeypatch.setattr(s, "provision_ccusage", lambda project_root, out: None)
     status = s.compute_status(project_dir, s.build_registry(), fetch=False)
     for cid in ("enforcement-hooks", "cost-tracker", "lint-gates"):
         assert status.file_statuses[cid] == s.MISSING
@@ -506,3 +511,68 @@ def test_present_root_follows_normal_flow(
     )
     status = s.compute_status(project_dir, s.build_registry())
     assert status.file_statuses["schema-clone"] == s.MODIFIED
+
+
+# --------------------------------------------------------------------------- #
+# cost-tracker ccusage provisioning (pnpm precondition + install step)
+# --------------------------------------------------------------------------- #
+def test_cost_tracker_blocked_when_pnpm_absent(
+    project_dir, fake_claude_home, openspec_root, monkeypatch
+):
+    """No `pnpm` on PATH → cost-tracker BLOCKED with the pnpm remedy reported,
+    and nothing installed under tokencost/."""
+    monkeypatch.setattr(s, "resolve_source_sha", lambda src: "sha1")
+    monkeypatch.setattr(s, "pnpm_available", lambda project_root: False)
+
+    status = s.compute_status(project_dir, s.build_registry())
+    assert status.file_statuses["cost-tracker"] == s.BLOCKED
+
+    # install refuses it, prints the pnpm remedy, writes nothing.
+    out = io.StringIO()
+    s.cmd_install(project_dir, s.build_registry(), reader=lambda _p: "s", out=out)
+    text = out.getvalue()
+    assert "cost-tracker — BLOCKED" in text
+    assert "pnpm" in text
+    assert not (project_dir / "tokencost").exists()
+    assert "cost-tracker" not in s.read_manifest(project_dir)["components"]
+
+    # check / list report the same remedy.
+    for cmd in (s.cmd_check, s.cmd_list):
+        buf = io.StringIO()
+        cmd(project_dir, s.build_registry(), out=buf)
+        assert "pnpm" in buf.getvalue()
+
+
+def test_cost_tracker_provisions_ccusage_when_pnpm_present(
+    project_dir, fake_claude_home, openspec_root, monkeypatch
+):
+    """`pnpm` present → cost-tracker installs and `pnpm add -g ccusage` fires."""
+    monkeypatch.setattr(s, "resolve_source_sha", lambda src: "sha1")
+    monkeypatch.setattr(s, "pnpm_available", lambda project_root: True)
+
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(s.subprocess, "run", fake_run)
+
+    out = io.StringIO()
+    # "i" installs cost-tracker; blocked components (none here) self-skip.
+    s.cmd_install(project_dir, s.build_registry(), reader=lambda _p: "i", out=out)
+
+    assert (project_dir / "tokencost" / "cost-tracker.py").is_file()
+    assert ["pnpm", "add", "-g", "ccusage"] in calls
+    assert "provisioned ccusage via pnpm" in out.getvalue()
+
+
+def test_provision_ccusage_failure_is_warning_not_fatal(project_dir, monkeypatch):
+    """A non-zero `pnpm add -g ccusage` exit warns but does not raise."""
+    def fake_run(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 1)
+
+    monkeypatch.setattr(s.subprocess, "run", fake_run)
+    out = io.StringIO()
+    s.provision_ccusage(project_dir, out=out)  # must not raise
+    assert "non-zero" in out.getvalue()

@@ -69,6 +69,25 @@ SKILL_ID_RE = re.compile(r"^[^/\s]+/[^/\s:]+:[^\s:]+$")
 # --------------------------------------------------------------------------- #
 # Component registry
 # --------------------------------------------------------------------------- #
+# Remedy printed when a `needs_openspec` component is BLOCKED. Kept as a module
+# constant so it is one instance of the generalized precondition shape below.
+OPENSPEC_REMEDY = (
+    "OpenSpec is not initialized. Run `openspec init . --tools claude` first, "
+    "then re-run install."
+)
+
+
+@dataclass
+class Precondition:
+    """A per-component runtime gate. When `check` is unmet the component is
+    classified BLOCKED and `remedy` is the actionable message reported to the
+    user. `needs_openspec` is a second, root-probe-threaded instance of the same
+    shape (see `unmet_precondition`)."""
+
+    check: Callable[[Path], bool]
+    remedy: str
+
+
 @dataclass
 class FileComponent:
     """A component installed by copying tracked files from this checkout's templates/."""
@@ -91,6 +110,13 @@ class FileComponent:
     # classified BLOCKED (precondition unmet) instead of MISSING, and install
     # refuses it rather than fabricating an unrecognized openspec/ tree.
     needs_openspec: bool = False
+    # optional runtime precondition (predicate + remedy). When unmet the
+    # component is BLOCKED, mirroring needs_openspec but for a general dependency
+    # (e.g. cost-tracker requires `pnpm` to provision ccusage).
+    precondition: Optional[Precondition] = None
+    # optional post-copy step: given (project_root, out), run after the tracked
+    # files are installed. Used by cost-tracker to provision the ccusage CLI.
+    post_install: Optional[Callable[[Path, object], None]] = None
     kind: str = "file"
 
 
@@ -776,6 +802,16 @@ def build_registry() -> list:
                 ("tokencost/sum-cost.py", "tokencost/sum-cost.py"),
                 ("tokencost/.provenance", "tokencost/.provenance"),
             ],
+            # The tracker resolves per-session cost via the `ccusage` CLI, which
+            # is provisioned globally with `pnpm`. Absent `pnpm` the tracker can
+            # only log ERROR, so gate the component on `pnpm` being on PATH.
+            precondition=Precondition(
+                check=pnpm_available,
+                remedy="`pnpm` is not on PATH. Install Node and pnpm "
+                       "(https://pnpm.io/installation), then re-run install; "
+                       "the scaffold provisions ccusage via `pnpm add -g ccusage`.",
+            ),
+            post_install=provision_ccusage,
         ),
         FileComponent(
             id="lint-gates",
@@ -907,6 +943,25 @@ def openspec_initialized(project_root: Path) -> bool:
 # --------------------------------------------------------------------------- #
 # Drift classification (file components)
 # --------------------------------------------------------------------------- #
+def unmet_precondition(
+    project_root: Path,
+    comp: FileComponent,
+    openspec_ready: bool = True,
+) -> Optional[str]:
+    """The remedy string for a component's first unmet precondition, or None.
+
+    Unifies the two precondition instances: the root-probe-threaded
+    `needs_openspec` and the general `precondition` (predicate + remedy). A
+    non-None result means the component is BLOCKED; the string is what
+    install/check/list report so the user sees how to satisfy it.
+    """
+    if comp.needs_openspec and not openspec_ready:
+        return OPENSPEC_REMEDY
+    if comp.precondition is not None and not comp.precondition.check(project_root):
+        return comp.precondition.remedy
+    return None
+
+
 def classify_file_component(
     project_root: Path,
     comp: FileComponent,
@@ -927,11 +982,12 @@ def classify_file_component(
     (the default) makes it read the file itself.
 
     `openspec_ready` is the single `openspec_initialized` probe result threaded
-    in by the caller. A `needs_openspec` component classifies BLOCKED when the
-    root is absent — precedence over MISSING/OK/STALE — so install refuses it and
-    check/list report the unmet precondition rather than a fabricated tree.
+    in by the caller. Any unmet precondition — `needs_openspec` when the root is
+    absent, or a general `precondition` predicate — classifies BLOCKED, with
+    precedence over MISSING/OK/STALE, so install refuses it and check/list report
+    the unmet precondition rather than a fabricated tree.
     """
-    if comp.needs_openspec and not openspec_ready:
+    if unmet_precondition(project_root, comp, openspec_ready) is not None:
         return BLOCKED
 
     # Filler components (config-interview) have no tracked source hash and write
@@ -1019,6 +1075,39 @@ def component_diff(project_root: Path, comp: FileComponent) -> str:
         )
         chunks.append("".join(diff))
     return "\n".join(c for c in chunks if c.strip())
+
+
+# --------------------------------------------------------------------------- #
+# cost-tracker runtime provisioning (ccusage via pnpm)
+# --------------------------------------------------------------------------- #
+def pnpm_available(_project_root: Path) -> bool:
+    """`pnpm` on PATH — the runtime the cost-tracker install step needs."""
+    return shutil.which("pnpm") is not None
+
+
+def provision_ccusage(project_root: Path, out=sys.stdout) -> None:
+    """Install the ccusage CLI globally via `pnpm add -g ccusage`.
+
+    The cost-tracker shells out to `ccusage` to resolve per-session cost; without
+    it the tracker logs `total_cost_usd = "ERROR"`. This runs as the component's
+    post-copy step (only when the `pnpm` precondition is satisfied). A non-zero
+    exit or missing binary is surfaced as a warning, not fatal: the tracker still
+    degrades to `ERROR`, so a failed provision must not abort the scaffold run.
+    """
+    try:
+        result = subprocess.run(
+            ["pnpm", "add", "-g", "ccusage"],
+            check=False,
+        )
+    except (FileNotFoundError, OSError) as exc:
+        print(f"  ! ccusage provisioning failed ({exc}); cost-tracker will log "
+              "ERROR until `pnpm add -g ccusage` succeeds.", file=out)
+        return
+    if result.returncode != 0:
+        print("  ! `pnpm add -g ccusage` exited non-zero; cost-tracker will log "
+              "ERROR until it is installed.", file=out)
+        return
+    print("  provisioned ccusage via pnpm.", file=out)
 
 
 # --------------------------------------------------------------------------- #
@@ -1321,6 +1410,9 @@ def cmd_list(project_root: Path, registry: list, out=sys.stdout) -> int:
         if isinstance(comp, FileComponent):
             st = status.file_statuses[comp.id]
             print(f"  [{st:<14}] {comp.id}  (file)  — {comp.description}", file=out)
+            if st == BLOCKED:
+                remedy = unmet_precondition(project_root, comp, status.openspec_ready)
+                print(f"       {remedy}", file=out)
     for comp in registry:
         if isinstance(comp, PluginComponent):
             st = status.plugin_statuses.get(comp.id, MISSING)
@@ -1352,7 +1444,11 @@ def cmd_check(project_root: Path, registry: list, out=sys.stdout) -> int:
     print("File components:", file=out)
     for comp in registry:
         if isinstance(comp, FileComponent):
-            print(f"  {status.file_statuses[comp.id]:<14} {comp.id}", file=out)
+            st = status.file_statuses[comp.id]
+            print(f"  {st:<14} {comp.id}", file=out)
+            if st == BLOCKED:
+                remedy = unmet_precondition(project_root, comp, status.openspec_ready)
+                print(f"    {remedy}", file=out)
     print("Plugins:", file=out)
     for pid, st in status.plugin_statuses.items():
         print(f"  {st:<14} {pid}", file=out)
@@ -1381,12 +1477,12 @@ def cmd_install(
 
     for comp in registry:
         if isinstance(comp, FileComponent) and status.file_statuses[comp.id] == BLOCKED:
-            # OpenSpec-dependent component with no initialized root. Refuse and
-            # print the remedy; write nothing under openspec/ (do not auto-run
-            # init — it requires a --tools choice the scaffold should not own).
+            # Precondition unmet: refuse and print the component-specific remedy;
+            # write nothing (e.g. do not auto-run `openspec init` — it requires a
+            # --tools choice the scaffold should not own).
+            remedy = unmet_precondition(project_root, comp, status.openspec_ready)
             print(f"\n{comp.id} — {BLOCKED}: {comp.description}", file=out)
-            print("  OpenSpec is not initialized. Run `openspec init . --tools "
-                  "claude` first, then re-run install.", file=out)
+            print(f"  {remedy}", file=out)
             continue
         if isinstance(comp, FileComponent) and comp.filler is not None:
             # Interview-style component: always offer [i]nterview / [s]kip, even
@@ -1419,6 +1515,8 @@ def cmd_install(
                 install_file_component(project_root, comp, manifest, source_sha)
                 write_manifest(project_root, manifest)
                 print("  installed.", file=out)
+                if comp.post_install is not None:
+                    comp.post_install(project_root, out)
                 break
         elif isinstance(comp, PluginComponent):
             st = status.plugin_statuses.get(comp.id, MISSING)
@@ -1490,6 +1588,10 @@ def cmd_update(
 
     for comp in targets:
         st = status.file_statuses[comp.id]
+        if st == BLOCKED:
+            remedy = unmet_precondition(project_root, comp, status.openspec_ready)
+            print(f"{comp.id}: {BLOCKED} — {remedy}", file=out)
+            continue
         if st in (MODIFIED, MODIFIED_STALE) and not force:
             print(
                 f"{comp.id}: {st} — refusing to overwrite local edits without "
@@ -1503,6 +1605,8 @@ def cmd_update(
         install_file_component(project_root, comp, manifest, source_sha)
         write_manifest(project_root, manifest)
         print(f"{comp.id}: updated.", file=out)
+        if comp.post_install is not None:
+            comp.post_install(project_root, out)
     return 0
 
 

@@ -57,6 +57,13 @@ a root and install normally on a non-OpenSpec repo.
 - `enforcement-hooks` — `branch_guard.py` (asks on edits to `main`/`master`) and
   `commit_gate.py` (blocks `git commit` on failing tests/lint).
 - `cost-tracker` — project-local `tokencost/` tracker with a `.provenance` stamp.
+  The tracker resolves per-session cost via the `ccusage` CLI, which the scaffold
+  provisions automatically with `pnpm add -g ccusage` on install. **`pnpm` (and
+  Node) are a prerequisite**: when `pnpm` is not on PATH the component classifies
+  **BLOCKED** — same mechanism as the OpenSpec-root gate above — and `install`
+  refuses it with a remedy pointing at https://pnpm.io/installation rather than
+  installing a tracker that can only log `total_cost_usd = "ERROR"`. A failed
+  `pnpm add -g ccusage` (offline, registry down) is a warning, not fatal.
 - `lint-gates` — `lint_specs.py` and `lint_given.py`, pure-Python (no Node).
 
 **Plugin components** — reconciled against
