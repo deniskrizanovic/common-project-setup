@@ -76,6 +76,13 @@ OPENSPEC_REMEDY = (
     "then re-run install."
 )
 
+# Remedy printed when a `needs_git` component is BLOCKED — mirrors OPENSPEC_REMEDY
+# but for the git-repository gate (github-init needs a work tree to have a remote).
+GIT_REMEDY = (
+    "Not a git repository. Run `git init` and make an initial commit first, "
+    "then re-run install."
+)
+
 
 @dataclass
 class Precondition:
@@ -110,6 +117,11 @@ class FileComponent:
     # classified BLOCKED (precondition unmet) instead of MISSING, and install
     # refuses it rather than fabricating an unrecognized openspec/ tree.
     needs_openspec: bool = False
+    # True when the component requires the project root to be a git work tree
+    # (e.g. github-init detects a git remote). Absent a repo, such a component is
+    # classified BLOCKED, mirroring needs_openspec. Install prints how to init git
+    # and takes no outward action.
+    needs_git: bool = False
     # optional runtime precondition (predicate + remedy). When unmet the
     # component is BLOCKED, mirroring needs_openspec but for a general dependency
     # (e.g. cost-tracker requires `pnpm` to provision ccusage).
@@ -117,6 +129,12 @@ class FileComponent:
     # optional post-copy step: given (project_root, out), run after the tracked
     # files are installed. Used by cost-tracker to provision the ccusage CLI.
     post_install: Optional[Callable[[Path, object], None]] = None
+    # optional print-only installer: given (project_root, out), print advisory
+    # commands instead of copying anything. A printer-bearing component tracks no
+    # files, records no hash, and takes no outward action — its drift is
+    # satisfied()-only (BLOCKED/MISSING/OK). Used by github-init to nag the user
+    # to create a GitHub repo without running the command itself.
+    printer: Optional[Callable[[Path, object], None]] = None
     kind: str = "file"
 
 
@@ -822,6 +840,17 @@ def build_registry() -> list:
                 ("scripts/lint_given.py", "scripts/lint_given.py"),
             ],
         ),
+        FileComponent(
+            id="github-init",
+            version=1,
+            description="Nag to create a GitHub origin remote (print-only, needs_git)",
+            # No tracked files: the component only prints advisory commands.
+            files=[],
+            # OK once an origin remote exists (any host); MISSING otherwise.
+            satisfied=has_origin_remote,
+            printer=print_github_init,
+            needs_git=True,
+        ),
         *_plugin_components(),
         *_skill_components(),
     ]
@@ -909,6 +938,47 @@ def resolve_source_sha(source: dict) -> Optional[str]:
 
 
 # --------------------------------------------------------------------------- #
+# Git repository / remote probes (github-init gate)
+# --------------------------------------------------------------------------- #
+def is_git_repo(project_root: Path) -> bool:
+    """True when the project root is inside a git work tree.
+
+    The `needs_git` gate for github-init: absent a work tree there is no place
+    for a remote to live, so the component is BLOCKED. Shells out to
+    `git rev-parse --is-inside-work-tree`; a missing git binary or a non-repo
+    dir both fail closed to False so the gate blocks rather than nagging.
+    """
+    try:
+        out = subprocess.check_output(
+            ["git", "-C", str(project_root), "rev-parse", "--is-inside-work-tree"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+        return False
+    return out == "true"
+
+
+def has_origin_remote(project_root: Path, _text: Optional[str] = None) -> bool:
+    """True when the project root has an `origin` remote (on any host).
+
+    The cheapest signal that a push target exists (`git remote get-url origin`).
+    Any host counts — we only care that a remote is configured, not that it is
+    github.com. The `_text` parameter matches the satisfied() predicate seam
+    (project_root, text) and is ignored. Absent git / no origin → False.
+    """
+    try:
+        out = subprocess.check_output(
+            ["git", "-C", str(project_root), "remote", "get-url", "origin"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+        return False
+    return bool(out)
+
+
+# --------------------------------------------------------------------------- #
 # OpenSpec initialization probe
 # --------------------------------------------------------------------------- #
 def openspec_initialized(project_root: Path) -> bool:
@@ -947,16 +1017,19 @@ def unmet_precondition(
     project_root: Path,
     comp: FileComponent,
     openspec_ready: bool = True,
+    git_ready: bool = True,
 ) -> Optional[str]:
     """The remedy string for a component's first unmet precondition, or None.
 
-    Unifies the two precondition instances: the root-probe-threaded
-    `needs_openspec` and the general `precondition` (predicate + remedy). A
-    non-None result means the component is BLOCKED; the string is what
-    install/check/list report so the user sees how to satisfy it.
+    Unifies the precondition instances: the root-probe-threaded `needs_openspec`,
+    the git-work-tree-probe-threaded `needs_git`, and the general `precondition`
+    (predicate + remedy). A non-None result means the component is BLOCKED; the
+    string is what install/check/list report so the user sees how to satisfy it.
     """
     if comp.needs_openspec and not openspec_ready:
         return OPENSPEC_REMEDY
+    if comp.needs_git and not git_ready:
+        return GIT_REMEDY
     if comp.precondition is not None and not comp.precondition.check(project_root):
         return comp.precondition.remedy
     return None
@@ -969,6 +1042,7 @@ def classify_file_component(
     source_sha: Optional[str],
     config_text: Optional[str] = None,
     openspec_ready: bool = True,
+    git_ready: bool = True,
 ) -> str:
     """Classify a file component using disk, manifest, and source SHA.
 
@@ -981,19 +1055,21 @@ def classify_file_component(
     Every satisfied() predicate accepts (project_root, text=None); passing None
     (the default) makes it read the file itself.
 
-    `openspec_ready` is the single `openspec_initialized` probe result threaded
-    in by the caller. Any unmet precondition — `needs_openspec` when the root is
-    absent, or a general `precondition` predicate — classifies BLOCKED, with
-    precedence over MISSING/OK/STALE, so install refuses it and check/list report
-    the unmet precondition rather than a fabricated tree.
+    `openspec_ready` / `git_ready` are the single `openspec_initialized` /
+    `is_git_repo` probe results threaded in by the caller. Any unmet precondition —
+    `needs_openspec` when the root is absent, `needs_git` when not a repo, or a
+    general `precondition` predicate — classifies BLOCKED, with precedence over
+    MISSING/OK/STALE, so install refuses it and check/list report the unmet
+    precondition rather than a fabricated tree.
     """
-    if unmet_precondition(project_root, comp, openspec_ready) is not None:
+    if unmet_precondition(project_root, comp, openspec_ready, git_ready) is not None:
         return BLOCKED
 
-    # Filler components (config-interview) have no tracked source hash and write
-    # nothing to the manifest: their whole drift model is the satisfied()
-    # predicate — OK when customized, MISSING otherwise. Never STALE/MODIFIED.
-    if comp.filler is not None:
+    # Printer / filler components (github-init, config-interview) have no tracked
+    # source hash and write nothing to the manifest: their whole drift model is
+    # the satisfied() predicate — OK when satisfied, MISSING otherwise. They never
+    # produce STALE/MODIFIED. github-init's satisfied() is has_origin_remote.
+    if comp.filler is not None or comp.printer is not None:
         return OK if (comp.satisfied and comp.satisfied(project_root, config_text)) else MISSING
 
     entry = manifest["components"].get(comp.id)
@@ -1108,6 +1184,31 @@ def provision_ccusage(project_root: Path, out=sys.stdout) -> None:
               "ERROR until it is installed.", file=out)
         return
     print("  provisioned ccusage via pnpm.", file=out)
+
+
+# --------------------------------------------------------------------------- #
+# github-init print-only installer
+# --------------------------------------------------------------------------- #
+def print_github_init(project_root: Path, out=sys.stdout) -> None:
+    """Print (never run) the commands to create the GitHub repo and push.
+
+    Consistent with the codebase's refusals to auto-run outward, hard-to-reverse
+    actions (openspec init, claude plugin install, npx skills add): creating a
+    public repo is the most outward of all, so it inherits the same treatment.
+    Repo name defaults to the project directory basename (the
+    `gh repo create --source=.` convention), so the primary line is copy-paste
+    ready. A no-gh fallback is printed for when the CLI is absent. This mutates
+    no local git config and no remote GitHub state.
+    """
+    basename = project_root.name
+    print("  No GitHub `origin` remote. Create the repo and push with:", file=out)
+    print(
+        f"    gh repo create {basename} --public --source=. --remote=origin --push",
+        file=out,
+    )
+    print("  Without the gh CLI: create the repository on github.com, then:", file=out)
+    print(f"    git remote add origin git@github.com:<owner>/{basename}.git", file=out)
+    print("    git push -u origin main", file=out)
 
 
 # --------------------------------------------------------------------------- #
@@ -1355,6 +1456,7 @@ class Status:
     source_sha: Optional[str] = None
     offline: bool = False
     openspec_ready: bool = True
+    git_ready: bool = True
 
 
 def compute_status(project_root: Path, registry: list, *, fetch: bool = True) -> Status:
@@ -1372,6 +1474,15 @@ def compute_status(project_root: Path, registry: list, *, fetch: bool = True) ->
         else True
     )
 
+    # Probe git-work-tree presence once, threaded into every `needs_git`
+    # classification, mirroring the openspec probe. Only meaningful when some
+    # component needs a repo (github-init).
+    git_ready = (
+        is_git_repo(project_root)
+        if any(isinstance(c, FileComponent) and c.needs_git for c in registry)
+        else True
+    )
+
     # Read config.yaml once; the config-baseline and config-interview predicates
     # share this instead of each re-reading the file.
     config_text = _config_yaml_text(project_root)
@@ -1379,7 +1490,8 @@ def compute_status(project_root: Path, registry: list, *, fetch: bool = True) ->
     for comp in registry:
         if isinstance(comp, FileComponent):
             file_statuses[comp.id] = classify_file_component(
-                project_root, comp, manifest, source_sha, config_text, openspec_ready
+                project_root, comp, manifest, source_sha, config_text,
+                openspec_ready, git_ready,
             )
 
     desired = compose_wishlist(project_root)
@@ -1397,6 +1509,7 @@ def compute_status(project_root: Path, registry: list, *, fetch: bool = True) ->
         source_sha=source_sha,
         offline=offline,
         openspec_ready=openspec_ready,
+        git_ready=git_ready,
     )
 
 
@@ -1411,7 +1524,7 @@ def cmd_list(project_root: Path, registry: list, out=sys.stdout) -> int:
             st = status.file_statuses[comp.id]
             print(f"  [{st:<14}] {comp.id}  (file)  — {comp.description}", file=out)
             if st == BLOCKED:
-                remedy = unmet_precondition(project_root, comp, status.openspec_ready)
+                remedy = unmet_precondition(project_root, comp, status.openspec_ready, status.git_ready)
                 print(f"       {remedy}", file=out)
     for comp in registry:
         if isinstance(comp, PluginComponent):
@@ -1447,7 +1560,7 @@ def cmd_check(project_root: Path, registry: list, out=sys.stdout) -> int:
             st = status.file_statuses[comp.id]
             print(f"  {st:<14} {comp.id}", file=out)
             if st == BLOCKED:
-                remedy = unmet_precondition(project_root, comp, status.openspec_ready)
+                remedy = unmet_precondition(project_root, comp, status.openspec_ready, status.git_ready)
                 print(f"    {remedy}", file=out)
     print("Plugins:", file=out)
     for pid, st in status.plugin_statuses.items():
@@ -1480,7 +1593,7 @@ def cmd_install(
             # Precondition unmet: refuse and print the component-specific remedy;
             # write nothing (e.g. do not auto-run `openspec init` — it requires a
             # --tools choice the scaffold should not own).
-            remedy = unmet_precondition(project_root, comp, status.openspec_ready)
+            remedy = unmet_precondition(project_root, comp, status.openspec_ready, status.git_ready)
             print(f"\n{comp.id} — {BLOCKED}: {comp.description}", file=out)
             print(f"  {remedy}", file=out)
             continue
@@ -1494,6 +1607,17 @@ def cmd_install(
             if choice == "s":
                 continue
             comp.filler(project_root, reader, out)
+            continue
+        if isinstance(comp, FileComponent) and comp.printer is not None:
+            # Print-only component (github-init): no prompt, no write, no outward
+            # action. On OK report satisfied; on MISSING print the advisory
+            # commands. BLOCKED was handled above.
+            st = status.file_statuses[comp.id]
+            print(f"\n{comp.id} — {st}: {comp.description}", file=out)
+            if st == OK:
+                print("  satisfied; nothing to do.", file=out)
+                continue
+            comp.printer(project_root, out)
             continue
         if isinstance(comp, FileComponent):
             st = status.file_statuses[comp.id]
@@ -1569,17 +1693,27 @@ def cmd_update(
         c
         for c in registry
         if isinstance(c, FileComponent)
-        and c.filler is None  # interview components are install-only, no update
+        # interview (filler) and print-only (printer) components have no tracked
+        # files to re-copy, so `update` is a no-op for them: install-only.
+        and c.filler is None
+        and c.printer is None
         and (component is None or c.id == component)
     ]
     if component is not None and not targets:
         # Distinguish a real-but-install-only component (a filler like
-        # config-interview) from a genuinely unknown id.
+        # config-interview, or a printer like github-init) from an unknown id.
         named = next((c for c in registry if getattr(c, "id", None) == component), None)
         if isinstance(named, FileComponent) and named.filler is not None:
             print(
                 f"{component}: install-only (guided interview); "
                 f"run `install` to (re)fill it.",
+                file=out,
+            )
+            return 0
+        if isinstance(named, FileComponent) and named.printer is not None:
+            print(
+                f"{component}: install-only (print-only advisory); "
+                f"run `install` to see the commands.",
                 file=out,
             )
             return 0
@@ -1589,7 +1723,7 @@ def cmd_update(
     for comp in targets:
         st = status.file_statuses[comp.id]
         if st == BLOCKED:
-            remedy = unmet_precondition(project_root, comp, status.openspec_ready)
+            remedy = unmet_precondition(project_root, comp, status.openspec_ready, status.git_ready)
             print(f"{comp.id}: {BLOCKED} — {remedy}", file=out)
             continue
         if st in (MODIFIED, MODIFIED_STALE) and not force:

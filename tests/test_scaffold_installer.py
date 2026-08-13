@@ -554,12 +554,15 @@ def test_cost_tracker_provisions_ccusage_when_pnpm_present(
 
     def fake_run(argv, **kwargs):
         calls.append(argv)
-        return subprocess.CompletedProcess(argv, 0)
+        # stdout must be a str: the github-init git probe shells out via
+        # check_output (which reads .stdout); "" → is_git_repo False → github-init
+        # BLOCKED (self-skips, no prompt), which is fine for this cost-tracker test.
+        return subprocess.CompletedProcess(argv, 0, stdout="")
 
     monkeypatch.setattr(s.subprocess, "run", fake_run)
 
     out = io.StringIO()
-    # "i" installs cost-tracker; blocked components (none here) self-skip.
+    # "i" installs cost-tracker; blocked components (github-init here) self-skip.
     s.cmd_install(project_dir, s.build_registry(), reader=lambda _p: "i", out=out)
 
     assert (project_dir / "tokencost" / "cost-tracker.py").is_file()

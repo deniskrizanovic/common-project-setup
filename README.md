@@ -65,6 +65,16 @@ a root and install normally on a non-OpenSpec repo.
   installing a tracker that can only log `total_cost_usd = "ERROR"`. A failed
   `pnpm add -g ccusage` (offline, registry down) is a warning, not fatal.
 - `lint-gates` — `lint_specs.py` and `lint_given.py`, pure-Python (no Node).
+- `github-init` — **print-only** nag to create a GitHub `origin` remote. Tracks no
+  files, records no hash, takes no outward action. Detection keys on the git
+  `origin` remote: not a git repository → **BLOCKED** (`git init` remedy; needs a
+  work tree — same gate mechanism as the OpenSpec-root and `pnpm` gates); no
+  `origin` → **MISSING**; `origin` present (any host) → **OK**, reported and never
+  managed. Only BLOCKED/MISSING/OK — never STALE/MODIFIED. On MISSING `install`
+  **prints** (never runs) `gh repo create <basename> --public --source=. --remote=origin
+  --push` (basename = project dir) plus a no-gh fallback (`git remote add origin …`
+  + `git push -u origin main`) — consistent with the openspec-init / plugin / skill
+  refusals to auto-run outward actions.
 
 **Plugin components** — reconciled against
 `~/.claude/plugins/installed_plugins.json`, installed via `claude plugin install`:
