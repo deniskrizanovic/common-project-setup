@@ -15,7 +15,7 @@ python3 scaffold.py --project <dir> <command>
 | Command | What it does |
 | --- | --- |
 | `list`   | Prints every registered component and its status. No prompts, no writes. |
-| `check`  | Read-only drift report (MISSING / STALE / MODIFIED / MODIFIED+STALE / OK / EXTRA). Writes nothing. |
+| `check`  | Read-only drift report (MISSING / STALE / MODIFIED / MODIFIED+STALE / OK / EXTRA / BLOCKED). Writes nothing. |
 | `install`| Interactive per-component picker: `[i]nstall/update`, `[d]iff`, `[s]kip`. Wires hooks idempotently at the end. |
 | `update [<component>] [--force]` | Applies pending updates. A MODIFIED component is refused unless `--force` is given. |
 | `gen` | Regenerates `scaffold_base/plugins.json` and `skills-lock.json` from `manifest.yaml`. |
@@ -42,6 +42,18 @@ Two classes behind one registry (`build_registry()` in `scaffold.py`):
   `list` classify it MISSING/OK and write nothing.
 - `schema-clone` — local `spec-driven` schema clone with the `> **Tests:**` /
   `- **GIVEN**` instructions and templates.
+
+`config-baseline`, `config-interview`, and `schema-clone` write inside
+`openspec/` and therefore **require an initialized OpenSpec root**. Before
+touching them the scaffold runs `openspec list --json` and requires a non-null
+`.root`; a missing `openspec` CLI, a non-zero exit, or unparseable output all
+count as not-initialized. When the root is absent these three classify
+**BLOCKED** (not MISSING): `install` refuses them, prints
+`openspec init . --tools claude`, and writes nothing under `openspec/` — it does
+**not** auto-run init (that needs a `--tools` choice the scaffold won't guess);
+`check`/`list` report BLOCKED read-only. The other components
+(`enforcement-hooks`, `cost-tracker`, `lint-gates`, plugins, skills) do not need
+a root and install normally on a non-OpenSpec repo.
 - `enforcement-hooks` — `branch_guard.py` (asks on edits to `main`/`master`) and
   `commit_gate.py` (blocks `git commit` on failing tests/lint).
 - `cost-tracker` — project-local `tokencost/` tracker with a `.provenance` stamp.
@@ -100,6 +112,9 @@ not be evaluated, and never reports a component as current on that basis.
 `.scaffold/manifest.json` records `{component, version, source_sha, files:{path:
 sha256}}`. `check` re-hashes disk files and compares three ways:
 
+- OpenSpec-dependent component (`config-baseline`, `config-interview`,
+  `schema-clone`) with no initialized root → **BLOCKED** (takes precedence over
+  MISSING)
 - no manifest entry / files absent / `config-baseline` unsatisfied → **MISSING**
 - disk == manifest, ref advanced past `source_sha` → **STALE**
 - disk != manifest → **MODIFIED** (+ **MODIFIED+STALE** if the ref also moved)

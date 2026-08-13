@@ -3,12 +3,12 @@
     {
       "id": "caveman@caveman",
       "marketplace": "caveman",
-      "marketplaceSource": "dk-krizanovic/caveman"
+      "marketplaceSource": "JuliusBrussee/caveman"
     },
     {
       "id": "superpowers@claude-plugins-official",
       "marketplace": "claude-plugins-official",
-      "marketplaceSource": "anthropics/claude-plugins"
+      "marketplaceSource": "anthropics/claude-plugins-official"
     }
   ]
 }

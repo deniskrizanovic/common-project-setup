@@ -47,6 +47,10 @@ MODIFIED = "MODIFIED"
 MODIFIED_STALE = "MODIFIED+STALE"
 OK = "OK"
 EXTRA = "EXTRA"
+# Precondition unmet: an OpenSpec-dependent component with no initialized root.
+# Distinct from MISSING ("installable now"); install refuses it, check/list
+# report it read-only.
+BLOCKED = "BLOCKED"
 
 # Where this script and its payloads live (canonical source in the repo).
 REPO_ROOT = Path(__file__).resolve().parent
@@ -82,6 +86,11 @@ class FileComponent:
     # A filler-bearing component has no tracked source hash: it classifies
     # MISSING/OK only (via `satisfied`), never STALE/MODIFIED.
     filler: Optional[Callable[[Path, Callable, object], None]] = None
+    # True when the component reads/writes inside openspec/ and therefore
+    # requires an initialized OpenSpec root. Absent a root, such a component is
+    # classified BLOCKED (precondition unmet) instead of MISSING, and install
+    # refuses it rather than fabricating an unrecognized openspec/ tree.
+    needs_openspec: bool = False
     kind: str = "file"
 
 
@@ -719,6 +728,7 @@ def build_registry() -> list:
             description="Filled openspec/config.yaml (context + traceability rules)",
             files=[("openspec/config.yaml", "openspec/config.yaml")],
             satisfied=_config_is_real,
+            needs_openspec=True,
         ),
         FileComponent(
             id="config-interview",
@@ -728,6 +738,7 @@ def build_registry() -> list:
             files=[],
             satisfied=_context_is_customized,
             filler=_config_interview_filler,
+            needs_openspec=True,
         ),
         FileComponent(
             id="schema-clone",
@@ -745,6 +756,7 @@ def build_registry() -> list:
                 ("openspec/schemas/spec-driven/templates/tasks.md",
                  "openspec/schemas/spec-driven/templates/tasks.md"),
             ],
+            needs_openspec=True,
         ),
         FileComponent(
             id="enforcement-hooks",
@@ -861,6 +873,43 @@ def resolve_source_sha(source: dict) -> Optional[str]:
 
 
 # --------------------------------------------------------------------------- #
+# OpenSpec initialization probe
+# --------------------------------------------------------------------------- #
+def openspec_initialized(project_root: Path) -> bool:
+    """True only when `openspec list --json` reports a non-null `.root`.
+
+    The scaffold's OpenSpec-dependent components (config-baseline,
+    config-interview, schema-clone) write inside `openspec/`. Installing them
+    on a repo that never ran `openspec init` fabricates a partial tree the CLI
+    does not recognize as a root (`.root: null`). `.root` is the discriminator:
+    null on an empty or scaffold-fabricated tree, non-null only after real init.
+
+    Fails closed — a missing `openspec` CLI, non-zero exit, timeout, or
+    unparseable output all return False so the gate blocks rather than
+    fabricating a tree.
+    """
+    if shutil.which("openspec") is None:
+        return False
+    try:
+        proc = subprocess.run(
+            ["openspec", "list", "--json"],
+            cwd=str(project_root),
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if proc.returncode != 0:
+        return False
+    try:
+        data = json.loads(proc.stdout)
+    except (json.JSONDecodeError, ValueError):
+        return False
+    return data.get("root") is not None
+
+
+# --------------------------------------------------------------------------- #
 # Drift classification (file components)
 # --------------------------------------------------------------------------- #
 def classify_file_component(
@@ -869,6 +918,7 @@ def classify_file_component(
     manifest: dict,
     source_sha: Optional[str],
     config_text: Optional[str] = None,
+    openspec_ready: bool = True,
 ) -> str:
     """Classify a file component using disk, manifest, and source SHA.
 
@@ -880,7 +930,15 @@ def classify_file_component(
     config-baseline and config-interview reads that file once, not per component.
     Every satisfied() predicate accepts (project_root, text=None); passing None
     (the default) makes it read the file itself.
+
+    `openspec_ready` is the single `openspec_initialized` probe result threaded
+    in by the caller. A `needs_openspec` component classifies BLOCKED when the
+    root is absent — precedence over MISSING/OK/STALE — so install refuses it and
+    check/list report the unmet precondition rather than a fabricated tree.
     """
+    if comp.needs_openspec and not openspec_ready:
+        return BLOCKED
+
     # Filler components (config-interview) have no tracked source hash and write
     # nothing to the manifest: their whole drift model is the satisfied()
     # predicate — OK when customized, MISSING otherwise. Never STALE/MODIFIED.
@@ -1212,6 +1270,7 @@ class Status:
     skill_statuses: dict = field(default_factory=dict)
     source_sha: Optional[str] = None
     offline: bool = False
+    openspec_ready: bool = True
 
 
 def compute_status(project_root: Path, registry: list, *, fetch: bool = True) -> Status:
@@ -1220,6 +1279,15 @@ def compute_status(project_root: Path, registry: list, *, fetch: bool = True) ->
     source_sha = resolve_source_sha(source) if fetch else None
     offline = source_sha is None
 
+    # Probe OpenSpec initialization once; the boolean is threaded into every
+    # file-component classification so blocked components do not each re-invoke
+    # the CLI. Only meaningful when some component needs a root.
+    openspec_ready = (
+        openspec_initialized(project_root)
+        if any(isinstance(c, FileComponent) and c.needs_openspec for c in registry)
+        else True
+    )
+
     # Read config.yaml once; the config-baseline and config-interview predicates
     # share this instead of each re-reading the file.
     config_text = _config_yaml_text(project_root)
@@ -1227,7 +1295,7 @@ def compute_status(project_root: Path, registry: list, *, fetch: bool = True) ->
     for comp in registry:
         if isinstance(comp, FileComponent):
             file_statuses[comp.id] = classify_file_component(
-                project_root, comp, manifest, source_sha, config_text
+                project_root, comp, manifest, source_sha, config_text, openspec_ready
             )
 
     desired = compose_wishlist(project_root)
@@ -1244,6 +1312,7 @@ def compute_status(project_root: Path, registry: list, *, fetch: bool = True) ->
         skill_statuses=skill_statuses,
         source_sha=source_sha,
         offline=offline,
+        openspec_ready=openspec_ready,
     )
 
 
@@ -1316,6 +1385,14 @@ def cmd_install(
     source_sha = status.source_sha
 
     for comp in registry:
+        if isinstance(comp, FileComponent) and status.file_statuses[comp.id] == BLOCKED:
+            # OpenSpec-dependent component with no initialized root. Refuse and
+            # print the remedy; write nothing under openspec/ (do not auto-run
+            # init — it requires a --tools choice the scaffold should not own).
+            print(f"\n{comp.id} — {BLOCKED}: {comp.description}", file=out)
+            print("  OpenSpec is not initialized. Run `openspec init . --tools "
+                  "claude` first, then re-run install.", file=out)
+            continue
         if isinstance(comp, FileComponent) and comp.filler is not None:
             # Interview-style component: always offer [i]nterview / [s]kip, even
             # when OK/customized, so the context can be revised on a re-run.

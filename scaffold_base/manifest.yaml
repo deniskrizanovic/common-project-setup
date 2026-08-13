@@ -10,9 +10,9 @@
 
 plugins:
   - id: caveman@caveman
-    source: dk-krizanovic/caveman
+    source: JuliusBrussee/caveman
   - id: superpowers@claude-plugins-official
-    source: anthropics/claude-plugins
+    source: anthropics/claude-plugins-official
 
 # Each skill is an `owner/repo:skill-path` string.
 skills:
