@@ -169,9 +169,16 @@ apply:
     checkboxes), so a cheaper model usually suffices. Before touching the first
     task, ask the user whether to downgrade the implementation model (for
     example Opus to Sonnet). You cannot switch models yourself — tell the user
-    to run `/model` (or `/fast`) to downgrade, then wait for their choice before
-    proceeding. If you have already asked this session, or the user declined, do
-    not prompt again — continue working the task list.
+    to run `/model` (or `/fast`) to downgrade.
+
+    THIS IS A HARD STOP, NOT A COURTESY NOTE. Ask, then end your turn and wait
+    for the user's answer. In the turn where you show this prompt you MUST NOT
+    read context files, work any task, mark any checkbox, or make any edit.
+    Do not print the prompt and then continue in the same turn ("Proceeding
+    now; interrupt if you want to switch" is exactly the wrong behavior). Stop
+    and wait. Resume the workflow only after the user has answered.
+    If you have already asked this session, or the user declined, do not prompt
+    again — continue working the task list.
 
     Read context files, work through pending tasks, mark complete as you go.
     Pause if you hit blockers or need clarification.
