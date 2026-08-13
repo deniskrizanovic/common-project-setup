@@ -122,6 +122,12 @@ def test_hook_wiring_idempotent(project_dir):
     assert sum("branch_guard.py" in c for c in cmds) == 1
 
 
+def test_hook_wiring_returns_added_flag(project_dir):
+    # First wiring adds hooks -> True; second is a no-op -> False.
+    assert s.wire_hooks(project_dir) is True
+    assert s.wire_hooks(project_dir) is False
+
+
 def test_hook_wiring_preserves_unrelated(project_dir):
     settings_path = project_dir / ".claude" / "settings.json"
     settings_path.parent.mkdir(parents=True)

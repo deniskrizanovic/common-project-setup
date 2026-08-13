@@ -1452,7 +1452,13 @@ def cmd_install(
                     print(f"    {cmd}", file=out)
 
     # Wire hooks idempotently once enforcement-hooks/cost-tracker present.
-    wire_hooks(project_root)
+    if wire_hooks(project_root):
+        print(
+            "\nHooks wired into .claude/settings.json. Claude Code loads hooks "
+            "at session start, so restart your session (or reload with /hooks) "
+            "to activate them.",
+            file=out,
+        )
     return 0
 
 
@@ -1517,10 +1523,11 @@ def _hook_command_exists(hooks_block: list, command: str) -> bool:
     return False
 
 
-def wire_hooks(project_root: Path) -> None:
+def wire_hooks(project_root: Path) -> bool:
     """Add branch-guard, commit-gate, and cost-tracker hooks idempotently.
 
     Dedupes by exact command string and preserves unrelated existing hooks.
+    Returns True if any hook was newly added (caller can prompt a restart).
     """
     settings_path = project_root / ".claude" / "settings.json"
     settings = {}
@@ -1546,15 +1553,18 @@ def wire_hooks(project_root: Path) -> None:
         ("SessionEnd", "", cost_end_cmd),
     ]
 
+    added = False
     for event, matcher, command in wanted:
         block = hooks.setdefault(event, [])
         if _hook_command_exists(block, command):
             continue
         entry = {"type": "command", "command": command}
         block.append({"matcher": matcher, "hooks": [entry]})
+        added = True
 
     settings_path.parent.mkdir(parents=True, exist_ok=True)
     settings_path.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
+    return added
 
 
 # --------------------------------------------------------------------------- #
