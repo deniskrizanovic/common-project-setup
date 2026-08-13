@@ -85,6 +85,28 @@ def stub_claude_cli(tmp_path, monkeypatch):
 
 
 @pytest.fixture
+def openspec_root(monkeypatch):
+    """Stub an initialized OpenSpec root: `openspec_initialized` returns True.
+
+    The OpenSpec-dependent components (config-baseline, config-interview,
+    schema-clone) only follow their normal MISSING/OK/MODIFIED flow when a root
+    is present; without this stub the live probe returns False in a throwaway
+    project dir and those components classify BLOCKED.
+    """
+    import scaffold as s
+
+    monkeypatch.setattr(s, "openspec_initialized", lambda project_root: True)
+
+
+@pytest.fixture
+def no_openspec_root(monkeypatch):
+    """Stub an uninitialized OpenSpec root: `openspec_initialized` returns False."""
+    import scaffold as s
+
+    monkeypatch.setattr(s, "openspec_initialized", lambda project_root: False)
+
+
+@pytest.fixture
 def no_claude_cli(tmp_path, monkeypatch):
     """A PATH with no `claude` executable (CLI-absent scenario)."""
     bindir = tmp_path / "empty_bin"

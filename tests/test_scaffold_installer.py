@@ -120,7 +120,7 @@ def test_install_skips_present_component(project_dir, fake_claude_home, monkeypa
     assert target.stat().st_mtime_ns == mtime_before
 
 
-def test_install_diff_option(project_dir, fake_claude_home, monkeypatch):
+def test_install_diff_option(project_dir, fake_claude_home, openspec_root, monkeypatch):
     """The diff option shows a unified diff before any write."""
     _install(project_dir, "lint-gates", "sha_old")
     (project_dir / "scripts" / "lint_specs.py").write_text("local edit\n", encoding="utf-8")
@@ -200,7 +200,7 @@ def test_interview_drift_missing_then_ok(project_dir, fake_claude_home, monkeypa
     assert s.classify_file_component(project_dir, comp, manifest, None) == s.OK
 
 
-def test_install_offers_interview_on_ok_component(project_dir, fake_claude_home, monkeypatch):
+def test_install_offers_interview_on_ok_component(project_dir, fake_claude_home, openspec_root, monkeypatch):
     """Even customized (OK), install re-offers the interview (3.4)."""
     monkeypatch.setattr(s, "resolve_source_sha", lambda src: None)
     _write_template_config(project_dir)
@@ -360,3 +360,169 @@ def test_update_truly_unknown_component_still_errors(project_dir):
     rc = s.cmd_update(project_dir, s.build_registry(), component="nope-nope", out=out)
     assert rc == 1
     assert "Unknown component: nope-nope" in out.getvalue()
+
+
+# --------------------------------------------------------------------------- #
+# OpenSpec-root precondition (BLOCKED)
+# --------------------------------------------------------------------------- #
+OPENSPEC_COMPONENTS = ("config-baseline", "config-interview", "schema-clone")
+
+
+class _FakeProc:
+    def __init__(self, returncode, stdout):
+        self.returncode = returncode
+        self.stdout = stdout
+
+
+def test_openspec_initialized_true_on_non_null_root(project_dir, monkeypatch):
+    """A non-null `.root` from `openspec list --json` → True (4.1)."""
+    monkeypatch.setattr(s.shutil, "which", lambda name: "/usr/bin/openspec")
+    monkeypatch.setattr(
+        s.subprocess, "run",
+        lambda *a, **k: _FakeProc(0, '{"root": "/some/proj", "changes": []}'),
+    )
+    assert s.openspec_initialized(project_dir) is True
+
+
+def test_openspec_initialized_false_on_null_root(project_dir, monkeypatch):
+    """A null `.root` → False (4.1)."""
+    monkeypatch.setattr(s.shutil, "which", lambda name: "/usr/bin/openspec")
+    monkeypatch.setattr(
+        s.subprocess, "run",
+        lambda *a, **k: _FakeProc(0, '{"root": null}'),
+    )
+    assert s.openspec_initialized(project_dir) is False
+
+
+def test_openspec_initialized_false_when_cli_missing(project_dir, monkeypatch):
+    """A missing `openspec` CLI → False, without shelling out (4.1)."""
+    monkeypatch.setattr(s.shutil, "which", lambda name: None)
+
+    def boom(*a, **k):
+        raise AssertionError("must not shell out when CLI is absent")
+
+    monkeypatch.setattr(s.subprocess, "run", boom)
+    assert s.openspec_initialized(project_dir) is False
+
+
+def test_openspec_initialized_false_on_bad_json(project_dir, monkeypatch):
+    """Unparseable output → False (4.1)."""
+    monkeypatch.setattr(s.shutil, "which", lambda name: "/usr/bin/openspec")
+    monkeypatch.setattr(
+        s.subprocess, "run",
+        lambda *a, **k: _FakeProc(0, "not json at all"),
+    )
+    assert s.openspec_initialized(project_dir) is False
+
+
+def test_openspec_initialized_false_on_nonzero_exit(project_dir, monkeypatch):
+    """A non-zero exit → False (4.1)."""
+    monkeypatch.setattr(s.shutil, "which", lambda name: "/usr/bin/openspec")
+    monkeypatch.setattr(
+        s.subprocess, "run",
+        lambda *a, **k: _FakeProc(1, ""),
+    )
+    assert s.openspec_initialized(project_dir) is False
+
+
+def test_install_blocks_openspec_components_without_root(
+    project_dir, fake_claude_home, no_openspec_root, monkeypatch
+):
+    """No root → the three components are BLOCKED, nothing written under openspec/,
+    and the init remedy is printed (4.2)."""
+    monkeypatch.setattr(s, "resolve_source_sha", lambda src: None)
+    reader = lambda _prompt: "s"
+    out = io.StringIO()
+    s.cmd_install(project_dir, s.build_registry(), reader=reader, out=out)
+    text = out.getvalue()
+    for cid in OPENSPEC_COMPONENTS:
+        assert f"{cid} — BLOCKED" in text
+    assert "openspec init . --tools claude" in text
+    # No openspec/ tree fabricated for the blocked components.
+    assert not (project_dir / "openspec").exists()
+    # Manifest records none of the blocked components.
+    manifest = s.read_manifest(project_dir)
+    for cid in OPENSPEC_COMPONENTS:
+        assert cid not in manifest["components"]
+
+
+def test_install_installs_independent_components_without_root(
+    project_dir, fake_claude_home, no_openspec_root, monkeypatch
+):
+    """OpenSpec-independent components still install with no root (4.3).
+
+    With no root the OpenSpec-dependent components are BLOCKED, but
+    enforcement-hooks / cost-tracker / lint-gates are unaffected and classify
+    normally (MISSING here) — install writes them on a plain `i`.
+    """
+    monkeypatch.setattr(s, "resolve_source_sha", lambda src: "sha1")
+    # Keep the run hermetic: no real plugin/skill CLI shell-outs.
+    monkeypatch.setattr(s, "install_plugin", lambda plugin: True)
+    monkeypatch.setattr(s, "install_skill", lambda skill_id, project_root: True)
+    status = s.compute_status(project_dir, s.build_registry(), fetch=False)
+    for cid in ("enforcement-hooks", "cost-tracker", "lint-gates"):
+        assert status.file_statuses[cid] == s.MISSING
+
+    # Install every offered file component; blocked ones self-skip (no prompt),
+    # so a constant "i" installs the independent ones.
+    out = io.StringIO()
+    s.cmd_install(project_dir, s.build_registry(), reader=lambda _p: "i", out=out)
+    assert (project_dir / "scripts" / "lint_specs.py").is_file()
+    assert (project_dir / "scripts" / "branch_guard.py").is_file()
+    assert (project_dir / "tokencost" / "cost-tracker.py").is_file()
+    # The blocked components wrote nothing.
+    assert not (project_dir / "openspec").exists()
+
+
+def test_check_reports_blocked_read_only(
+    project_dir, fake_claude_home, no_openspec_root, monkeypatch
+):
+    """`check` reports BLOCKED without writing (4.4)."""
+    monkeypatch.setattr(s, "resolve_source_sha", lambda src: None)
+    before = sorted(p.name for p in project_dir.iterdir())
+    out = io.StringIO()
+    s.cmd_check(project_dir, s.build_registry(), out=out)
+    after = sorted(p.name for p in project_dir.iterdir())
+    assert before == after
+    assert not s.manifest_path(project_dir).exists()
+    text = out.getvalue()
+    for cid in OPENSPEC_COMPONENTS:
+        assert f"{s.BLOCKED:<14} {cid}" in text
+
+
+def test_list_reports_blocked_without_prompting(
+    project_dir, fake_claude_home, no_openspec_root, monkeypatch
+):
+    """`list` prints BLOCKED and never prompts (4.4)."""
+    monkeypatch.setattr(s, "resolve_source_sha", lambda src: None)
+
+    def boom(*a, **k):
+        raise AssertionError("list must not prompt")
+
+    monkeypatch.setattr("builtins.input", boom)
+    out = io.StringIO()
+    assert s.cmd_list(project_dir, s.build_registry(), out=out) == 0
+    text = out.getvalue()
+    for cid in OPENSPEC_COMPONENTS:
+        assert f"[{s.BLOCKED:<14}] {cid}" in text
+
+
+def test_present_root_follows_normal_flow(
+    project_dir, fake_claude_home, openspec_root, monkeypatch
+):
+    """With a present root the three components follow MISSING/OK/MODIFIED (4.5)."""
+    monkeypatch.setattr(s, "resolve_source_sha", lambda src: "sha1")
+    status = s.compute_status(project_dir, s.build_registry())
+    # Nothing installed yet → MISSING, not BLOCKED.
+    for cid in OPENSPEC_COMPONENTS:
+        assert status.file_statuses[cid] == s.MISSING
+    # Install schema-clone, then it reads OK.
+    _install(project_dir, "schema-clone", "sha1")
+    status = s.compute_status(project_dir, s.build_registry())
+    assert status.file_statuses["schema-clone"] == s.OK
+    # Tamper → MODIFIED.
+    (project_dir / "openspec" / "schemas" / "spec-driven" / "schema.yaml").write_text(
+        "tampered", encoding="utf-8"
+    )
+    status = s.compute_status(project_dir, s.build_registry())
+    assert status.file_statuses["schema-clone"] == s.MODIFIED
