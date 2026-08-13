@@ -6,6 +6,7 @@ nothing, MODIFIED update refused without --force, present component skipped.
 from __future__ import annotations
 
 import io
+import json
 
 import pytest
 
@@ -374,14 +375,36 @@ class _FakeProc:
         self.stdout = stdout
 
 
-def test_openspec_initialized_true_on_non_null_root(project_dir, monkeypatch):
-    """A non-null `.root` from `openspec list --json` → True (4.1)."""
+def test_openspec_initialized_true_on_root_at_project(project_dir, monkeypatch):
+    """A `.root.path` resolving to project_root → True (4.1)."""
     monkeypatch.setattr(s.shutil, "which", lambda name: "/usr/bin/openspec")
-    monkeypatch.setattr(
-        s.subprocess, "run",
-        lambda *a, **k: _FakeProc(0, '{"root": "/some/proj", "changes": []}'),
+    payload = json.dumps(
+        {"root": {"path": str(project_dir), "source": "nearest"}, "changes": []}
     )
+    monkeypatch.setattr(s.subprocess, "run", lambda *a, **k: _FakeProc(0, payload))
     assert s.openspec_initialized(project_dir) is True
+
+
+def test_openspec_initialized_true_on_bare_string_root(project_dir, monkeypatch):
+    """Tolerate an older bare-string `.root` equal to project_root → True."""
+    monkeypatch.setattr(s.shutil, "which", lambda name: "/usr/bin/openspec")
+    payload = json.dumps({"root": str(project_dir), "changes": []})
+    monkeypatch.setattr(s.subprocess, "run", lambda *a, **k: _FakeProc(0, payload))
+    assert s.openspec_initialized(project_dir) is True
+
+
+def test_openspec_initialized_false_on_ancestor_root(project_dir, monkeypatch):
+    """A root anchored at an ANCESTOR (`source: nearest`) → False (leak guard).
+
+    `openspec list --json` walks up to the nearest ancestor root; a project
+    nested under an initialized parent must NOT pass the gate.
+    """
+    monkeypatch.setattr(s.shutil, "which", lambda name: "/usr/bin/openspec")
+    payload = json.dumps(
+        {"root": {"path": str(project_dir.parent), "source": "nearest"}}
+    )
+    monkeypatch.setattr(s.subprocess, "run", lambda *a, **k: _FakeProc(0, payload))
+    assert s.openspec_initialized(project_dir) is False
 
 
 def test_openspec_initialized_false_on_null_root(project_dir, monkeypatch):

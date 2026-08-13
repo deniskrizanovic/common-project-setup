@@ -876,17 +876,23 @@ def resolve_source_sha(source: dict) -> Optional[str]:
 # OpenSpec initialization probe
 # --------------------------------------------------------------------------- #
 def openspec_initialized(project_root: Path) -> bool:
-    """True only when `openspec list --json` reports a non-null `.root`.
+    """True only when `openspec list --json` reports a root AT `project_root`.
 
     The scaffold's OpenSpec-dependent components (config-baseline,
     config-interview, schema-clone) write inside `openspec/`. Installing them
     on a repo that never ran `openspec init` fabricates a partial tree the CLI
-    does not recognize as a root (`.root: null`). `.root` is the discriminator:
-    null on an empty or scaffold-fabricated tree, non-null only after real init.
+    does not recognize as a root.
 
-    Fails closed — a missing `openspec` CLI, non-zero exit, timeout, or
-    unparseable output all return False so the gate blocks rather than
-    fabricating a tree.
+    A non-null `.root` is NOT sufficient: `openspec list --json` walks UP the
+    directory tree to the nearest ancestor root and reports it with
+    `"source": "nearest"`. A project nested under an already-initialized parent
+    would inherit that ancestor's root and pass the gate despite never running
+    `openspec init` itself. The discriminator is therefore the root PATH: it
+    must resolve to `project_root`, not merely be present.
+
+    Fails closed — a missing `openspec` CLI, non-zero exit, timeout,
+    unparseable output, an absent/null root, or a root anchored at an ancestor
+    all return False so the gate blocks rather than fabricating a tree.
     """
     if shutil.which("openspec") is None:
         return False
@@ -906,7 +912,18 @@ def openspec_initialized(project_root: Path) -> bool:
         data = json.loads(proc.stdout)
     except (json.JSONDecodeError, ValueError):
         return False
-    return data.get("root") is not None
+    root = data.get("root")
+    if root is None:
+        return False
+    # `root` is a dict (`{"path": ..., "source": ...}`) on current CLIs; tolerate
+    # a bare string path from older/other shapes.
+    root_path = root.get("path") if isinstance(root, dict) else root
+    if not isinstance(root_path, str) or not root_path:
+        return False
+    try:
+        return Path(root_path).resolve() == project_root.resolve()
+    except OSError:
+        return False
 
 
 # --------------------------------------------------------------------------- #
