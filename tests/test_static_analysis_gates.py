@@ -330,16 +330,74 @@ def test_no_analyzer_config_file_written(project_dir, monkeypatch, language):
 
 
 # --------------------------------------------------------------------------- #
-# update is install-only for the writer component
+# update evaluates the writer component (no longer install-only)
 # --------------------------------------------------------------------------- #
-def test_update_static_analysis_reports_install_only(project_dir):
-    """`update static-analysis` is not 'Unknown component' — it's install-only."""
+def test_update_writer_blocked_prints_remedy(
+    project_dir, fake_claude_home, monkeypatch
+):
+    """Python project, ruff absent → `update` reports BLOCKED + remedy, no gate."""
+    monkeypatch.setattr(s, "resolve_source_sha", lambda src: None)
+    _all_absent(monkeypatch)
+    _write_config(project_dir, "Python")
     out = io.StringIO()
-    rc = s.cmd_update(project_dir, s.build_registry(), component="static-analysis", out=out)
+    rc = s.cmd_update(project_dir, s.build_registry(), out=out)
     assert rc == 0
-    msg = out.getvalue()
-    assert "install-only" in msg
-    assert "Unknown component" not in msg
+    text = out.getvalue()
+    assert f"static-analysis: {s.BLOCKED}" in text
+    assert "ruff" in text
+    assert not (project_dir / ".scaffold" / "gates.json").exists()
+
+
+def test_update_writer_registers_gates_when_ready(
+    project_dir, fake_claude_home, monkeypatch
+):
+    """Python project, ruff present, gates not registered → `update` runs writer."""
+    monkeypatch.setattr(s, "resolve_source_sha", lambda src: None)
+    _all_present(monkeypatch)
+    _write_config(project_dir, "Python")
+    out = io.StringIO()
+    rc = s.cmd_update(project_dir, s.build_registry(), out=out)
+    assert rc == 0
+    names = [g["name"] for g in _gates(project_dir)]
+    assert "lint:ruff" in names
+
+
+def test_update_writer_already_registered_noop(
+    project_dir, fake_claude_home, monkeypatch
+):
+    """Gates already registered → `update` reports current, writes nothing further."""
+    monkeypatch.setattr(s, "resolve_source_sha", lambda src: None)
+    _all_present(monkeypatch)
+    _write_config(project_dir, "Python")
+    s.register_static_analysis_gates(project_dir, out=io.StringIO())
+    before = (project_dir / ".scaffold" / "gates.json").read_text(encoding="utf-8")
+    out = io.StringIO()
+    rc = s.cmd_update(project_dir, s.build_registry(), out=out)
+    assert rc == 0
+    assert "static-analysis: current" in out.getvalue()
+    after = (project_dir / ".scaffold" / "gates.json").read_text(encoding="utf-8")
+    assert before == after
+
+
+def test_update_still_excludes_filler_and_printer(
+    project_dir, fake_claude_home, monkeypatch
+):
+    """`update` evaluates no filler/printer component and issues no prompt."""
+    monkeypatch.setattr(s, "resolve_source_sha", lambda src: None)
+    _all_present(monkeypatch)
+    _write_config(project_dir, "Python")
+
+    def _no_input(_prompt=""):
+        raise AssertionError("update must not prompt interactively")
+
+    monkeypatch.setattr("builtins.input", _no_input)
+    out = io.StringIO()
+    rc = s.cmd_update(project_dir, s.build_registry(), out=out)
+    assert rc == 0
+    text = out.getvalue()
+    # Filler (config-interview) and printer (github-init) are never evaluated.
+    assert "config-interview" not in text
+    assert "github-init" not in text
 
 
 # --------------------------------------------------------------------------- #
