@@ -65,6 +65,15 @@ a root and install normally on a non-OpenSpec repo.
   installing a tracker that can only log `total_cost_usd = "ERROR"`. A failed
   `pnpm add -g ccusage` (offline, registry down) is a warning, not fatal.
 - `lint-gates` — `lint_specs.py` and `lint_given.py`, pure-Python (no Node).
+  `lint_specs.py` resolves every non-`none` `> **Tests:**` citation against the
+  project's real test suite (discovery patterns keyed off the `Testing:` answer
+  in `openspec/config.yaml`) and fails on any identifier it cannot find;
+  `none` is a tracked exemption, counted and reported, and failed only when an
+  optional `noneShareThreshold` in `.scaffold/gates.json` is exceeded.
+  **Existing provisioned projects must re-run the scaffold (`scaffold` sync /
+  re-install) to receive this strengthened gate** — the check is inert until the
+  updated `lint_specs.py` is installed, so a stale copy still passes on
+  invented or mistyped test names.
 - `github-init` — **print-only** nag to create a GitHub `origin` remote. Tracks no
   files, records no hash, takes no outward action. Detection keys on the git
   `origin` remote: not a git repository → **BLOCKED** (`git init` remedy; needs a

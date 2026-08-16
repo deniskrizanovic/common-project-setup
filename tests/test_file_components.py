@@ -203,3 +203,168 @@ def test_lint_scans_change_deltas(tmp_path):
     (delta / "spec.md").write_text("#### Scenario: x\n- **GIVEN** g\n", encoding="utf-8")
     files = lint_specs.collect_spec_files(openspec)
     assert any("spec.md" in str(f) for f in files)
+
+
+# --------------------------------------------------------------------------- #
+# spec-test-traceability: cited tests resolve to real tests
+# --------------------------------------------------------------------------- #
+def _discovered(func_names=(), paths=()):
+    paths = set(paths)
+    return {
+        "func_names": set(func_names),
+        "paths": paths,
+        "basenames": {p.rsplit("/", 1)[-1] for p in paths},
+        "stems": {p.rsplit("/", 1)[-1].rsplit(".", 1)[0] for p in paths},
+    }
+
+
+def test_resolution_nonexistent_identifier_fails():
+    """A citation naming a test the suite does not contain is unresolved."""
+    content = (
+        "#### Scenario: cites missing test\n"
+        "> **Tests:** `test_does_not_exist`\n"
+        "- **GIVEN** g\n- **WHEN** w\n- **THEN** t\n"
+    )
+    result = lint_specs.analyze(content, _discovered(func_names={"test_real"}))
+    assert len(result["unresolved"]) == 1
+    assert result["unresolved"][0]["token"] == "test_does_not_exist"
+
+
+def test_resolution_real_function_name_passes():
+    """A citation matching a discovered test-function name resolves clean."""
+    content = (
+        "#### Scenario: cites real test\n"
+        "> **Tests:** `test_query_follows_pagination`\n"
+        "- **GIVEN** g\n- **WHEN** w\n- **THEN** t\n"
+    )
+    disc = _discovered(func_names={"test_query_follows_pagination"})
+    result = lint_specs.analyze(content, disc)
+    assert result["unresolved"] == []
+
+
+def test_resolution_real_file_path_passes():
+    """A file-path citation resolves against a discovered test file."""
+    content = (
+        "#### Scenario: cites real file\n"
+        "> **Tests:** [`tests/test_notion.py`](../tests/test_notion.py)\n"
+        "- **GIVEN** g\n- **WHEN** w\n- **THEN** t\n"
+    )
+    disc = _discovered(paths={"tests/test_notion.py"})
+    result = lint_specs.analyze(content, disc)
+    assert result["unresolved"] == []
+
+
+def test_resolution_none_is_exempt():
+    """The literal `none` is never resolved and never unresolved."""
+    content = (
+        "#### Scenario: untested\n> **Tests:** none\n"
+        "- **GIVEN** g\n- **WHEN** w\n- **THEN** t\n"
+    )
+    result = lint_specs.analyze(content, _discovered())
+    assert result["unresolved"] == []
+    assert result["none_count"] == 1
+
+
+# --------------------------------------------------------------------------- #
+# spec-test-traceability: none accounting + threshold
+# --------------------------------------------------------------------------- #
+def test_none_count_reported():
+    content = (
+        "#### Scenario: a\n> **Tests:** none\n- **GIVEN** g\n"
+        "#### Scenario: b\n> **Tests:** `test_x`\n- **GIVEN** g\n"
+        "#### Scenario: c\n> **Tests:** none\n- **GIVEN** g\n"
+    )
+    result = lint_specs.analyze(content, _discovered(func_names={"test_x"}))
+    assert result["none_count"] == 2
+    assert result["total"] == 3
+
+
+def test_none_threshold_exceeded_fails(tmp_path, capsys):
+    """Configured threshold fails the gate when the none share exceeds it."""
+    openspec = tmp_path / "openspec"
+    spec = openspec / "specs" / "cap"
+    spec.mkdir(parents=True)
+    (spec / "spec.md").write_text(
+        "#### Scenario: a\n> **Tests:** none\n- **GIVEN** g\n"
+        "#### Scenario: b\n> **Tests:** none\n- **GIVEN** g\n",
+        encoding="utf-8",
+    )
+    scaffold = tmp_path / ".scaffold"
+    scaffold.mkdir()
+    (scaffold / "gates.json").write_text(
+        json.dumps({"noneShareThreshold": 0.5}), encoding="utf-8"
+    )
+    rc = lint_specs.main(["lint_specs.py", str(tmp_path)])
+    assert rc == 1
+    assert "threshold" in capsys.readouterr().err.lower()
+
+
+def test_no_threshold_does_not_fail_on_none(tmp_path, capsys):
+    """With no threshold configured, all-`none` specs still pass."""
+    openspec = tmp_path / "openspec"
+    spec = openspec / "specs" / "cap"
+    spec.mkdir(parents=True)
+    (spec / "spec.md").write_text(
+        "#### Scenario: a\n> **Tests:** none\n- **GIVEN** g\n"
+        "#### Scenario: b\n> **Tests:** none\n- **GIVEN** g\n",
+        encoding="utf-8",
+    )
+    rc = lint_specs.main(["lint_specs.py", str(tmp_path)])
+    assert rc == 0
+    assert "2/2 cite 'none'" in capsys.readouterr().out
+
+
+def test_read_none_threshold_nested_and_absent(tmp_path):
+    assert lint_specs.read_none_threshold(tmp_path) is None
+    scaffold = tmp_path / ".scaffold"
+    scaffold.mkdir()
+    (scaffold / "gates.json").write_text(
+        json.dumps({"lint_specs": {"noneShareThreshold": 0.25}}), encoding="utf-8"
+    )
+    assert lint_specs.read_none_threshold(tmp_path) == 0.25
+
+
+# --------------------------------------------------------------------------- #
+# spec-test-traceability: test-technology mapping
+# --------------------------------------------------------------------------- #
+def test_discovery_follows_declared_technology(tmp_path):
+    openspec = tmp_path / "openspec"
+    openspec.mkdir(parents=True)
+    (openspec / "config.yaml").write_text(
+        "schema: spec-driven\ncontext: |\n  - Testing: pytest\n", encoding="utf-8"
+    )
+    answer = lint_specs.read_testing_answer(openspec)
+    assert answer == "pytest"
+    patterns, recognized = lint_specs.discovery_patterns(answer)
+    assert recognized
+    assert "**/test_*.py" in patterns["globs"]
+
+
+def test_unrecognized_technology_falls_back(capsys):
+    patterns, recognized = lint_specs.discovery_patterns("cobol-unit-thing")
+    assert recognized is False
+    assert patterns is lint_specs._DEFAULT_PATTERNS
+
+
+def test_unrecognized_technology_logged(tmp_path, capsys):
+    openspec = tmp_path / "openspec"
+    spec = openspec / "specs" / "cap"
+    spec.mkdir(parents=True)
+    (openspec / "config.yaml").write_text(
+        "schema: spec-driven\ncontext: |\n  - Testing: bespoke-runner\n",
+        encoding="utf-8",
+    )
+    (spec / "spec.md").write_text(
+        "#### Scenario: a\n> **Tests:** none\n- **GIVEN** g\n", encoding="utf-8"
+    )
+    lint_specs.main(["lint_specs.py", str(tmp_path)])
+    assert "not recognized" in capsys.readouterr().err
+
+
+def test_jest_test_titles_resolve(tmp_path):
+    """jest/vitest `it('title')` names discover as function identifiers."""
+    src = tmp_path / "sum.test.ts"
+    src.write_text("it('adds numbers', () => {});\n", encoding="utf-8")
+    patterns, _ = lint_specs.discovery_patterns("vitest")
+    disc = lint_specs.discover_tests(tmp_path, patterns)
+    assert "adds numbers" in disc["func_names"]

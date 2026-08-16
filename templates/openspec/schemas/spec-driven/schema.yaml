@@ -76,7 +76,7 @@ artifacts:
       - Every requirement MUST have at least one scenario.
       - **GHERKIN AUTHORING**: Before authoring scenarios, invoke the `gherkin-authoring` skill and apply its GIVEN/WHEN/THEN guidance — GIVEN describes a known initial state (not a user interaction), WHEN is one meaningful event, THEN is an observable outcome. In this repo the on-disk form is the markdown `#### Scenario:` + `- **GIVEN**` / `- **WHEN**` / `- **THEN**` bullet dialect, not real `.feature` syntax; use the skill for its authoring principles, not its literal syntax reference.
       - **GIVEN CLAUSE**: Every `#### Scenario:` MUST contain a `- **GIVEN**` clause describing its initial state, among the scenario's bullet lines. A scenario MUST NOT be a bare WHEN/THEN pair — an absent precondition hides the state a reader or test author needs. Omitting it fails the project's `lint:given` gate.
-      - **TEST TRACEABILITY**: Every `#### Scenario:` MUST be immediately followed by a `> **Tests:**` line citing the e2e/unit spec(s) that exercise it (e.g. `> **Tests:** [`path/to.spec.ts`](...) — case`), or the literal word `none` when no test exists yet (`> **Tests:** none`). The line goes between the `#### Scenario:` heading and the GIVEN/WHEN/THEN bullets. Omitting it fails the project's traceability lint gate; silence is not permitted because an absent line is indistinguishable from an overlooked one.
+      - **TEST TRACEABILITY**: Every `#### Scenario:` MUST be immediately followed by a `> **Tests:**` line citing the e2e/unit spec(s) that exercise it (e.g. `> **Tests:** [`path/to.spec.ts`](...) — case`), or the literal word `none` when no test exists yet (`> **Tests:** none`). The line goes between the `#### Scenario:` heading and the GIVEN/WHEN/THEN bullets. Omitting it fails the project's traceability lint gate; silence is not permitted because an absent line is indistinguishable from an overlooked one. Cite the **concrete** test identifier — a real test-function name (e.g. `test_query_follows_pagination`) or the test file path — as soon as the covering test exists; the `lint:specs` gate resolves each non-`none` citation against the project's test suite (by function name or file path) and FAILS on any identifier it cannot find, so an invented or mistyped name is rejected. Use `none` only while no covering test has been written yet; replace it with the real identifier once the test lands.
 
       MODIFIED requirements workflow:
       1. Locate the existing requirement in openspec/specs/<capability>/spec.md
@@ -210,3 +210,14 @@ apply:
 
     Read context files, work through pending tasks, mark complete as you go.
     Pause if you hit blockers or need clarification.
+
+    TEST CITATION BACKFILL (after implementing tests):
+    Whenever you write a test that exercises a scenario in this change's specs,
+    backfill its concrete identifier into that scenario's `> **Tests:**` line —
+    replace a placeholder `none` with the real test-function name or test file
+    path. Cite the actual identifier the `lint:specs` gate can resolve; never
+    invent or guess a name. Leave `> **Tests:** none` in place only for
+    scenarios that still have no covering test — do not fabricate a citation to
+    silence the gate. This step is additive to the directives above; it does not
+    replace the branch-isolation check, the model-downgrade prompt, or the
+    task-tracking workflow.
