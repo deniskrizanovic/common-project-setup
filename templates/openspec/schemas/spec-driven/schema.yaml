@@ -17,6 +17,20 @@ artifacts:
     description: Initial proposal document outlining the change
     template: proposal.md
     instruction: |
+      BRANCH ISOLATION (before writing any artifact):
+      Ensure work happens on a dedicated non-trunk branch for this change
+      (suggested convention: `change/<change-name>`). Check the current branch
+      first.
+
+      THIS IS A HARD STOP ON TRUNK. If the current branch is `main` or
+      `master`, do NOT write any artifact on it. Create and switch to the
+      change-scoped branch, or ask the user which branch to use, then end your
+      turn if you need their answer. Do not author artifacts on `main`/`master`.
+
+      If already on a non-trunk branch, confirm with the user that it is the
+      intended branch for this change before proceeding — do not silently assume
+      a stale or unrelated feature branch is correct.
+
       Create the proposal document that establishes WHY this change is needed.
 
       Sections:
@@ -164,6 +178,20 @@ apply:
   requires: [tasks]
   tracks: tasks.md
   instruction: |
+    BRANCH ISOLATION (before working the first task):
+    Ensure a dedicated non-trunk branch is checked out for this change
+    (suggested convention: `change/<change-name>`). Check the current branch
+    first.
+
+    THIS IS A HARD STOP ON TRUNK. If the current branch is `main` or `master`,
+    do NOT edit project code or mark any task on it. Switch to (or create) the
+    change-scoped branch, or ask the user which branch to use, then end your
+    turn if you need their answer. Do not apply on `main`/`master`.
+
+    If a non-trunk branch scoped to this change is already checked out, this
+    step is satisfied — proceed to the model-downgrade prompt and the task list
+    without further branch action.
+
     MODEL DOWNGRADE PROMPT (once per apply session, before any task work):
     Applying tasks is largely mechanical (working a checklist, flipping
     checkboxes), so a cheaper model usually suffices. Before touching the first
