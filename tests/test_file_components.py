@@ -1,7 +1,7 @@
 """Tests for config-baseline, enforcement-hooks, cost-tracker, and
 spec-test-traceability specs.
 
-empty-template flagged; branch-guard asks on main; commit-gate blocks on
+empty-template flagged; branch-guard blocks on main; commit-gate blocks on
 failing tests + allows on pass; idempotent re-wire adds no duplicates;
 cost-tracker installed project-local with provenance stamp; missing
 Tests:/GIVEN fails lint.
@@ -67,8 +67,9 @@ def test_installed_config_is_real(project_dir):
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize("branch", ["main", "master"])
 def test_branch_guard_asks_on_trunk(branch):
+    # Trunk edits are blocked (deny), not one-tap approvable (ask).
     out = branch_guard.decision(branch)
-    assert out["hookSpecificOutput"]["permissionDecision"] == "ask"
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
     assert branch in out["hookSpecificOutput"]["permissionDecisionReason"]
 
 

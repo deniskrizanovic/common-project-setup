@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Branch-guard PreToolUse hook.
 
-Emits an `ask` permission decision when an Edit/Write/NotebookEdit is attempted
-while the current git branch is `main` or `master`, so edits on the trunk
-require explicit approval.
+Emits a `deny` permission decision when an Edit/Write/NotebookEdit is attempted
+while the current git branch is `main` or `master`, blocking edits on the trunk
+so they require a deliberate branch or hook bypass rather than one-tap approval.
 
 Provenance: scaffold component `enforcement-hooks`.
 """
@@ -27,16 +27,17 @@ def current_branch(project_dir: Path) -> str:
 
 
 def decision(branch: str) -> dict | None:
-    """Ask JSON when on trunk, else None (no output = allow)."""
+    """Deny JSON when on trunk, else None (no output = allow)."""
     if branch in ("main", "master"):
         return {
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
-                "permissionDecision": "ask",
+                "permissionDecision": "deny",
                 "permissionDecisionReason": (
-                    f"You are on branch {branch}. Never edit on main/master. "
-                    "Approve to edit here anyway, or deny and create a feature "
-                    "branch first."
+                    f"You are on branch {branch}. Editing the trunk is blocked. "
+                    "Create or switch to a feature branch, then retry. If you "
+                    "truly intend to edit trunk, deliberately create a branch or "
+                    "disable this hook first."
                 ),
             }
         }

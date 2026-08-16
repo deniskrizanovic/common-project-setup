@@ -54,7 +54,7 @@ count as not-initialized. When the root is absent these three classify
 `check`/`list` report BLOCKED read-only. The other components
 (`enforcement-hooks`, `cost-tracker`, `lint-gates`, plugins, skills) do not need
 a root and install normally on a non-OpenSpec repo.
-- `enforcement-hooks` — `branch_guard.py` (asks on edits to `main`/`master`) and
+- `enforcement-hooks` — `branch_guard.py` (blocks edits on `main`/`master`) and
   `commit_gate.py` (blocks `git commit` on failing tests/lint).
 - `cost-tracker` — project-local `tokencost/` tracker with a `.provenance` stamp.
   The tracker resolves per-session cost via the `ccusage` CLI, which the scaffold
