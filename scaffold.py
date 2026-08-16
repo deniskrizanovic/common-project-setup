@@ -36,7 +36,7 @@ import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Optional, Union
 
 # --------------------------------------------------------------------------- #
 # Status constants
@@ -89,10 +89,18 @@ class Precondition:
     """A per-component runtime gate. When `check` is unmet the component is
     classified BLOCKED and `remedy` is the actionable message reported to the
     user. `needs_openspec` is a second, root-probe-threaded instance of the same
-    shape (see `unmet_precondition`)."""
+    shape (see `unmet_precondition`).
 
-    check: Callable[[Path], bool]
-    remedy: str
+    `remedy` is normally a fixed string, but may be a `(project_root) -> str`
+    callable when the actionable message depends on runtime state — e.g. the
+    static-analysis gate, whose missing-tool remedy names the specific analyzer
+    absent for the project's detected language. `unmet_precondition` resolves a
+    callable remedy to its string."""
+
+    # `check(project_root, text=None)` — the same seam satisfied() predicates use;
+    # `text` is config.yaml pre-read by the caller (may be ignored).
+    check: Callable[..., bool]
+    remedy: Union[str, Callable[[Path], str]]
 
 
 @dataclass
@@ -135,6 +143,13 @@ class FileComponent:
     # satisfied()-only (BLOCKED/MISSING/OK). Used by github-init to nag the user
     # to create a GitHub repo without running the command itself.
     printer: Optional[Callable[[Path, object], None]] = None
+    # optional in-place writer: given (project_root, out), write derived local
+    # project state instead of copying a template. Like `printer` it tracks no
+    # files and records no hash — its drift is satisfied()-only (BLOCKED/MISSING/
+    # OK), never STALE — but unlike printer it mutates a local file. Used by
+    # static-analysis to append gates to .scaffold/gates.json (no template, no
+    # outward action). Install-only (update is a no-op), same as filler/printer.
+    writer: Optional[Callable[[Path, object], None]] = None
     kind: str = "file"
 
 
@@ -851,6 +866,22 @@ def build_registry() -> list:
             printer=print_github_init,
             needs_git=True,
         ),
+        FileComponent(
+            id="static-analysis",
+            version=1,
+            description="Per-language static-analysis commit gates (ruff / biome+tsc / sf)",
+            # No tracked files: the writer appends gates to .scaffold/gates.json.
+            files=[],
+            # OK once the detected language's gates are registered (or none apply).
+            satisfied=_static_analysis_satisfied,
+            writer=register_static_analysis_gates,
+            # Absent analyzer for the detected language → BLOCKED + printed remedy;
+            # the scaffold never auto-installs the toolchain (Option B).
+            precondition=Precondition(
+                check=static_analysis_ready,
+                remedy=static_analysis_remedy,
+            ),
+        ),
         *_plugin_components(),
         *_skill_components(),
     ]
@@ -1018,6 +1049,7 @@ def unmet_precondition(
     comp: FileComponent,
     openspec_ready: bool = True,
     git_ready: bool = True,
+    config_text: Optional[str] = None,
 ) -> Optional[str]:
     """The remedy string for a component's first unmet precondition, or None.
 
@@ -1025,13 +1057,21 @@ def unmet_precondition(
     the git-work-tree-probe-threaded `needs_git`, and the general `precondition`
     (predicate + remedy). A non-None result means the component is BLOCKED; the
     string is what install/check/list report so the user sees how to satisfy it.
+
+    `config_text` is openspec/config.yaml pre-read by the caller and forwarded to
+    the precondition check (which accepts the `(project_root, text=None)` seam),
+    so a status pass that already read the file does not re-read it here — the
+    static-analysis precondition keys off that config.
     """
     if comp.needs_openspec and not openspec_ready:
         return OPENSPEC_REMEDY
     if comp.needs_git and not git_ready:
         return GIT_REMEDY
-    if comp.precondition is not None and not comp.precondition.check(project_root):
-        return comp.precondition.remedy
+    if comp.precondition is not None and not comp.precondition.check(
+        project_root, config_text
+    ):
+        remedy = comp.precondition.remedy
+        return remedy(project_root) if callable(remedy) else remedy
     return None
 
 
@@ -1062,14 +1102,18 @@ def classify_file_component(
     MISSING/OK/STALE, so install refuses it and check/list report the unmet
     precondition rather than a fabricated tree.
     """
-    if unmet_precondition(project_root, comp, openspec_ready, git_ready) is not None:
+    if unmet_precondition(
+        project_root, comp, openspec_ready, git_ready, config_text
+    ) is not None:
         return BLOCKED
 
-    # Printer / filler components (github-init, config-interview) have no tracked
-    # source hash and write nothing to the manifest: their whole drift model is
-    # the satisfied() predicate — OK when satisfied, MISSING otherwise. They never
-    # produce STALE/MODIFIED. github-init's satisfied() is has_origin_remote.
-    if comp.filler is not None or comp.printer is not None:
+    # Printer / filler / writer components (github-init, config-interview,
+    # static-analysis) have no tracked source hash and write nothing to the
+    # manifest: their whole drift model is the satisfied() predicate — OK when
+    # satisfied, MISSING otherwise. They never produce STALE/MODIFIED.
+    # github-init's satisfied() is has_origin_remote; static-analysis's is
+    # _static_analysis_satisfied.
+    if comp.filler is not None or comp.printer is not None or comp.writer is not None:
         return OK if (comp.satisfied and comp.satisfied(project_root, config_text)) else MISSING
 
     entry = manifest["components"].get(comp.id)
@@ -1156,8 +1200,11 @@ def component_diff(project_root: Path, comp: FileComponent) -> str:
 # --------------------------------------------------------------------------- #
 # cost-tracker runtime provisioning (ccusage via pnpm)
 # --------------------------------------------------------------------------- #
-def pnpm_available(_project_root: Path) -> bool:
-    """`pnpm` on PATH — the runtime the cost-tracker install step needs."""
+def pnpm_available(_project_root: Path, _text: Optional[str] = None) -> bool:
+    """`pnpm` on PATH — the runtime the cost-tracker install step needs.
+
+    Accepts the `(project_root, text=None)` precondition-check seam; `_text` is
+    ignored (this gate keys off PATH, not config)."""
     return shutil.which("pnpm") is not None
 
 
@@ -1209,6 +1256,266 @@ def print_github_init(project_root: Path, out=sys.stdout) -> None:
     print("  Without the gh CLI: create the repository on github.com, then:", file=out)
     print(f"    git remote add origin git@github.com:<owner>/{basename}.git", file=out)
     print("    git push -u origin main", file=out)
+
+
+# --------------------------------------------------------------------------- #
+# Static-analysis gates (per-language lint/typecheck, wired via .scaffold/gates.json)
+# --------------------------------------------------------------------------- #
+# The base commit gates the scaffold seeds into .scaffold/gates.json before the
+# per-language static-analysis gates. Mirrors commit_gate.py's built-in fallback
+# (tests / lint:specs / lint:given) — kept in sync by hand. Static gates are
+# appended AFTER these so the run order is tests -> lint -> static analysis.
+# Seeding these when gates.json does not yet exist preserves the exact commit_gate
+# defaults (materializing them changes no behavior, it only makes the file the
+# source of truth so the static gates can be appended).
+BASE_COMMIT_GATES = [
+    {
+        "name": "tests",
+        "cmd": ["pytest", "-q"],
+        "stopReason": "Tests failed — fix all failing tests before committing.",
+    },
+    {
+        "name": "lint:specs",
+        "cmd": ["python3", "scripts/lint_specs.py"],
+        "stopReason": "lint:specs failed — every scenario needs a '> **Tests:**' line.",
+    },
+    {
+        "name": "lint:given",
+        "cmd": ["python3", "scripts/lint_given.py"],
+        "stopReason": "lint:given failed — every scenario needs a '- **GIVEN**' clause.",
+    },
+]
+
+# Per-language static-analysis gate definitions. Each entry is the gate written
+# into .scaffold/gates.json ({name, cmd, stopReason}) plus the `tool` its command
+# needs on PATH (probed for BLOCKED classification; not written to the file).
+# Gate commands are the analyzers' zero-config default invocations only — no
+# ruff.toml / biome.json / code-analyzer.yml is templated (proposal: tool
+# defaults only).
+STATIC_ANALYSIS_GATES = {
+    "python": [
+        {
+            "name": "lint:ruff",
+            "cmd": ["ruff", "check"],
+            "tool": "ruff",
+            "stopReason": "lint:ruff failed — fix the ruff lint/format findings "
+                          "before committing.",
+        },
+    ],
+    "typescript": [
+        {
+            "name": "lint:biome",
+            "cmd": ["biome", "check"],
+            "tool": "biome",
+            "stopReason": "lint:biome failed — fix the Biome lint/format findings "
+                          "before committing.",
+        },
+        {
+            "name": "typecheck:tsc",
+            "cmd": ["tsc", "--noEmit"],
+            "tool": "tsc",
+            "stopReason": "typecheck:tsc failed — fix the TypeScript type errors "
+                          "before committing.",
+        },
+    ],
+    "salesforce": [
+        {
+            "name": "analyze:sf",
+            "cmd": ["sf", "code-analyzer", "run"],
+            "tool": "sf",
+            "stopReason": "analyze:sf failed — fix the Salesforce Code Analyzer "
+                          "violations before committing.",
+        },
+    ],
+}
+
+# `Language / runtime:` answer keyword -> canonical language. First matching entry
+# wins, so Salesforce is probed before the generic web-stack keywords (an Apex/LWC
+# project whose answer also names JavaScript still resolves to Salesforce).
+LANGUAGE_PATTERNS = [
+    (("salesforce", "apex", "sfdx"), "salesforce"),
+    (("python",), "python"),
+    (("typescript", "node", "javascript"), "typescript"),
+]
+
+# Install remedy per required tool, printed when the toolchain is absent (BLOCKED).
+# The scaffold prints these and never runs them (Option B: wire, don't own).
+STATIC_TOOL_REMEDIES = {
+    "ruff": "ruff (Python linter): `uv tool install ruff` or `pip install ruff`.",
+    "biome": "biome (TypeScript/JS linter): `npm install -g @biomejs/biome`.",
+    "tsc": "tsc (TypeScript compiler): `npm install -g typescript` "
+           "(or add it as a project dev dependency in node_modules/.bin).",
+    "sf": "sf (Salesforce CLI) with the Code Analyzer plugin: "
+          "`npm install -g @salesforce/cli` then `sf plugins install code-analyzer`.",
+}
+
+
+def read_language_answer(project_root: Path, text: Optional[str] = None) -> Optional[str]:
+    """The `Language / runtime:` answer from config.yaml's `context:` block.
+
+    Scans only inside the located `context: |` block (not the whole file), so the
+    prompt label quoted elsewhere never masquerades as an answer. Returns the
+    answer text, or None when the file/block/line is absent. `text` lets a caller
+    forward config.yaml's already-read contents (see classify_file_component).
+    """
+    if text is None:
+        text = _config_yaml_text(project_root)
+    if text is None:
+        return None
+    block = _context_block_text(text)
+    if block is None:
+        return None
+    m = re.search(r"(?im)^\s*-?\s*Language\s*/\s*runtime\s*:\s*(.+?)\s*$", block)
+    return m.group(1).strip() if m else None
+
+
+def detect_language(project_root: Path, text: Optional[str] = None) -> Optional[str]:
+    """Resolve the config `Language / runtime:` answer to a supported language.
+
+    Returns 'python' / 'typescript' / 'salesforce', or None when no answer is
+    present or it matches no supported language (the scaffold then registers no
+    static-analysis gates rather than guessing). Deliberately keys off
+    `Language / runtime:`, NOT `Testing:` (which names a test framework and is
+    ambiguous for Salesforce/Apex — that answer is lint_specs.py's concern).
+    """
+    answer = read_language_answer(project_root, text)
+    if not answer:
+        return None
+    low = answer.lower()
+    for keys, lang in LANGUAGE_PATTERNS:
+        if any(k in low for k in keys):
+            return lang
+    return None
+
+
+def _tool_available(tool: str, project_root: Path) -> bool:
+    """True when `tool`'s binary is runnable for this project.
+
+    For `tsc` a project-local `node_modules/.bin/tsc` is preferred over a global
+    one (a project pins its own TypeScript version); every other tool is a plain
+    PATH probe.
+    """
+    if tool == "tsc":
+        local = project_root / "node_modules" / ".bin" / "tsc"
+        if local.exists():
+            return True
+    return shutil.which(tool) is not None
+
+
+def missing_static_tools(project_root: Path, text: Optional[str] = None) -> list[str]:
+    """Required analyzer tools absent from PATH for the project's language.
+
+    Empty when the language is unsupported (nothing required) or every tool is
+    present. Order follows the language's gate list."""
+    lang = detect_language(project_root, text)
+    if lang is None:
+        return []
+    return [
+        gate["tool"]
+        for gate in STATIC_ANALYSIS_GATES[lang]
+        if not _tool_available(gate["tool"], project_root)
+    ]
+
+
+def static_analysis_ready(project_root: Path, text: Optional[str] = None) -> bool:
+    """Precondition predicate: no required analyzer is missing from PATH.
+
+    True (not BLOCKED) when the language is unsupported — there is simply nothing
+    to register in that case; the writer reports it. `text` is config.yaml
+    pre-read by the caller (the `(project_root, text=None)` precondition seam)."""
+    return not missing_static_tools(project_root, text)
+
+
+def static_analysis_remedy(project_root: Path) -> str:
+    """The BLOCKED remedy naming each analyzer missing for the detected language."""
+    missing = missing_static_tools(project_root)
+    lines = ["Static-analysis toolchain missing on PATH; install it, then re-run "
+             "install (the scaffold never auto-installs it):"]
+    for tool in missing:
+        lines.append("  " + STATIC_TOOL_REMEDIES.get(tool, f"{tool}: not found on PATH."))
+    return "\n".join(lines)
+
+
+def _load_gates_config(project_root: Path) -> dict:
+    """The parsed .scaffold/gates.json object ({} when absent/malformed).
+
+    Preserves sibling keys (e.g. noneShareThreshold) so the writer never drops
+    them when it appends the `gates` array."""
+    cfg = project_root / ".scaffold" / "gates.json"
+    if cfg.is_file():
+        try:
+            data = json.loads(cfg.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
+def registered_gate_names(project_root: Path) -> set:
+    """Names of every gate already in .scaffold/gates.json (empty when none)."""
+    gates = _load_gates_config(project_root).get("gates")
+    if not isinstance(gates, list):
+        return set()
+    return {g.get("name") for g in gates if isinstance(g, dict)}
+
+
+def _static_analysis_satisfied(project_root: Path, text: Optional[str] = None) -> bool:
+    """OK when this language's static gates are all registered (or none apply).
+
+    Unsupported language → True (nothing to register; the writer reports it, so
+    install does not nag). Supported → True only once every gate name for the
+    language is present in .scaffold/gates.json."""
+    lang = detect_language(project_root, text)
+    if lang is None:
+        return True
+    want = {gate["name"] for gate in STATIC_ANALYSIS_GATES[lang]}
+    return want <= registered_gate_names(project_root)
+
+
+def register_static_analysis_gates(project_root: Path, out=sys.stdout) -> None:
+    """Append the detected language's static-analysis gates to .scaffold/gates.json.
+
+    Idempotent: a gate whose name is already present is left untouched, so a
+    re-run adds no duplicates. When gates.json has no `gates` array yet, the base
+    commit gates are seeded first so the static gates land after them (and the
+    existing test/lint gates are not lost). Writes nothing outward and runs no
+    install command. An unsupported language registers nothing and says so.
+    """
+    lang = detect_language(project_root)
+    if lang is None:
+        print("  no supported `Language / runtime:` detected; "
+              "no static-analysis gates registered.", file=out)
+        return
+
+    data = _load_gates_config(project_root)
+    gates = data.get("gates")
+    if not isinstance(gates, list) or not gates:
+        gates = [dict(g) for g in BASE_COMMIT_GATES]
+    existing = {g.get("name") for g in gates if isinstance(g, dict)}
+
+    added: list[str] = []
+    for gate in STATIC_ANALYSIS_GATES[lang]:
+        if gate["name"] in existing:
+            continue
+        gates.append(
+            {
+                "name": gate["name"],
+                "cmd": list(gate["cmd"]),
+                "stopReason": gate["stopReason"],
+            }
+        )
+        existing.add(gate["name"])
+        added.append(gate["name"])
+
+    data["gates"] = gates
+    cfg = project_root / ".scaffold" / "gates.json"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    if added:
+        print(f"  registered static-analysis gate(s): {', '.join(added)}.", file=out)
+    else:
+        print("  static-analysis gates already registered; nothing to do.", file=out)
 
 
 # --------------------------------------------------------------------------- #
@@ -1619,6 +1926,17 @@ def cmd_install(
                 continue
             comp.printer(project_root, out)
             continue
+        if isinstance(comp, FileComponent) and comp.writer is not None:
+            # In-place writer component (static-analysis): no template copy, no
+            # manifest hash, no outward action. On OK report satisfied; on MISSING
+            # run the writer to derive local project state. BLOCKED handled above.
+            st = status.file_statuses[comp.id]
+            print(f"\n{comp.id} — {st}: {comp.description}", file=out)
+            if st == OK:
+                print("  satisfied; nothing to do.", file=out)
+                continue
+            comp.writer(project_root, out)
+            continue
         if isinstance(comp, FileComponent):
             st = status.file_statuses[comp.id]
             print(f"\n{comp.id} — {st}: {comp.description}", file=out)
@@ -1693,10 +2011,12 @@ def cmd_update(
         c
         for c in registry
         if isinstance(c, FileComponent)
-        # interview (filler) and print-only (printer) components have no tracked
-        # files to re-copy, so `update` is a no-op for them: install-only.
+        # interview (filler), print-only (printer), and in-place writer components
+        # have no tracked files to re-copy, so `update` is a no-op for them:
+        # install-only.
         and c.filler is None
         and c.printer is None
+        and c.writer is None
         and (component is None or c.id == component)
     ]
     if component is not None and not targets:
@@ -1714,6 +2034,13 @@ def cmd_update(
             print(
                 f"{component}: install-only (print-only advisory); "
                 f"run `install` to see the commands.",
+                file=out,
+            )
+            return 0
+        if isinstance(named, FileComponent) and named.writer is not None:
+            print(
+                f"{component}: install-only (derives local project state); "
+                f"run `install` to (re)register it.",
                 file=out,
             )
             return 0

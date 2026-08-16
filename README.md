@@ -84,6 +84,26 @@ a root and install normally on a non-OpenSpec repo.
   --push` (basename = project dir) plus a no-gh fallback (`git remote add origin …`
   + `git push -u origin main`) — consistent with the openspec-init / plugin / skill
   refusals to auto-run outward actions.
+- `static-analysis` — per-language static-analysis commit gates, appended to
+  `.scaffold/gates.json` after the `tests` / `lint:specs` / `lint:given` gates so
+  `commit_gate.py` runs them in order and blocks `git commit` on the first
+  failure with that gate's own `stopReason`. The gate set is chosen from the
+  `Language / runtime:` answer in `openspec/config.yaml` (**not** `Testing:`,
+  which names a test framework and is ambiguous for Apex): **Python** →
+  `lint:ruff` (`ruff check`); **TypeScript** → `lint:biome` (`biome check`) +
+  `typecheck:tsc` (`tsc --noEmit`, preferring a project-local
+  `node_modules/.bin/tsc`); **Salesforce** → `analyze:sf` (`sf code-analyzer
+  run`). **Wire, don't own**: when a required analyzer is absent from PATH the
+  component classifies **BLOCKED** — same gate mechanism as the OpenSpec-root /
+  `pnpm` / git gates — prints the install remedy, and writes **no** gate that
+  could only fail; it never auto-installs a toolchain. An unrecognized
+  `Language / runtime:` registers nothing and says so (never guesses). **Tool
+  defaults only**: no `ruff.toml` / `biome.json` / `code-analyzer.yml` is
+  templated — each gate is the analyzer's plain default invocation (drop a config
+  file into the project to tune it). Tracks no files and records no hash (drift
+  is satisfied-only: BLOCKED/MISSING/OK, never STALE/MODIFIED); it is
+  install-only, so `update` is a no-op. **Existing provisioned projects must
+  re-run the scaffold to receive these gates** — inert until registered.
 
 **Plugin components** — reconciled against
 `~/.claude/plugins/installed_plugins.json`, installed via `claude plugin install`:

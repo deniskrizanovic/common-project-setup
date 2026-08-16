@@ -442,7 +442,7 @@ def test_install_installs_independent_components_without_root(
     # stub the ccusage provision so nothing installs globally.
     monkeypatch.setattr(s, "install_plugin", lambda plugin: True)
     monkeypatch.setattr(s, "install_skill", lambda skill_id, project_root: True)
-    monkeypatch.setattr(s, "pnpm_available", lambda project_root: True)
+    monkeypatch.setattr(s, "pnpm_available", lambda project_root, _text=None: True)
     monkeypatch.setattr(s, "provision_ccusage", lambda project_root, out: None)
     status = s.compute_status(project_dir, s.build_registry(), fetch=False)
     for cid in ("enforcement-hooks", "cost-tracker", "lint-gates"):
@@ -522,7 +522,7 @@ def test_cost_tracker_blocked_when_pnpm_absent(
     """No `pnpm` on PATH → cost-tracker BLOCKED with the pnpm remedy reported,
     and nothing installed under tokencost/."""
     monkeypatch.setattr(s, "resolve_source_sha", lambda src: "sha1")
-    monkeypatch.setattr(s, "pnpm_available", lambda project_root: False)
+    monkeypatch.setattr(s, "pnpm_available", lambda project_root, _text=None: False)
 
     status = s.compute_status(project_dir, s.build_registry())
     assert status.file_statuses["cost-tracker"] == s.BLOCKED
@@ -548,7 +548,7 @@ def test_cost_tracker_provisions_ccusage_when_pnpm_present(
 ):
     """`pnpm` present → cost-tracker installs and `pnpm add -g ccusage` fires."""
     monkeypatch.setattr(s, "resolve_source_sha", lambda src: "sha1")
-    monkeypatch.setattr(s, "pnpm_available", lambda project_root: True)
+    monkeypatch.setattr(s, "pnpm_available", lambda project_root, _text=None: True)
 
     calls = []
 
