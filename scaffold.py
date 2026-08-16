@@ -2011,12 +2011,13 @@ def cmd_update(
         c
         for c in registry
         if isinstance(c, FileComponent)
-        # interview (filler), print-only (printer), and in-place writer components
-        # have no tracked files to re-copy, so `update` is a no-op for them:
-        # install-only.
+        # interview (filler) and print-only (printer) components stay excluded:
+        # filler is interactive and printer is advisory, neither belongs in a
+        # non-interactive `update`. Writer components ARE evaluated — they derive
+        # local project state (e.g. static-analysis gates) an evolving scaffold
+        # must be able to propagate into existing projects through `update`.
         and c.filler is None
         and c.printer is None
-        and c.writer is None
         and (component is None or c.id == component)
     ]
     if component is not None and not targets:
@@ -2037,13 +2038,9 @@ def cmd_update(
                 file=out,
             )
             return 0
-        if isinstance(named, FileComponent) and named.writer is not None:
-            print(
-                f"{component}: install-only (derives local project state); "
-                f"run `install` to (re)register it.",
-                file=out,
-            )
-            return 0
+        # Writer components (static-analysis) are no longer install-only: they
+        # resolve into `targets` above and are evaluated, so a named writer never
+        # reaches this branch. Only filler/printer named targets land here.
         print(f"Unknown component: {component}", file=out)
         return 1
 
@@ -2052,6 +2049,15 @@ def cmd_update(
         if st == BLOCKED:
             remedy = unmet_precondition(project_root, comp, status.openspec_ready, status.git_ready)
             print(f"{comp.id}: {BLOCKED} — {remedy}", file=out)
+            continue
+        if comp.writer is not None:
+            # In-place writer (static-analysis): no template copy, no manifest
+            # hash — its drift is satisfied()-only, so MODIFIED/STALE never apply.
+            # OK → current, no-op; MISSING → run the writer. BLOCKED handled above.
+            if st == OK:
+                print(f"{comp.id}: current; nothing to do.", file=out)
+                continue
+            comp.writer(project_root, out)
             continue
         if st in (MODIFIED, MODIFIED_STALE) and not force:
             print(
