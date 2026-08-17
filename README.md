@@ -55,7 +55,11 @@ count as not-initialized. When the root is absent these three classify
 (`enforcement-hooks`, `cost-tracker`, `lint-gates`, plugins, skills) do not need
 a root and install normally on a non-OpenSpec repo.
 - `enforcement-hooks` — `branch_guard.py` (blocks edits on `main`/`master`) and
-  `commit_gate.py` (blocks `git commit` on failing tests/lint).
+  `commit_gate.py` (blocks `git commit` on failing tests/lint). `commit_gate.py`
+  exposes one shared runner (`run_all_gates`) with two entry points: the Claude
+  Code `PreToolUse` hook (JSON `{continue:false,…}` on stdin) and a
+  `--native` exit-code mode the git pre-commit hook shells out to — so both
+  paths run the same `.scaffold/gates.json` set and cannot drift.
 - `cost-tracker` — project-local `tokencost/` tracker with a `.provenance` stamp.
   The tracker resolves per-session cost via the `ccusage` CLI, which the scaffold
   provisions automatically with `pnpm add -g ccusage` on install. **`pnpm` (and
@@ -104,6 +108,26 @@ a root and install normally on a non-OpenSpec repo.
   is satisfied-only: BLOCKED/MISSING/OK, never STALE/MODIFIED); it is
   install-only, so `update` is a no-op. **Existing provisioned projects must
   re-run the scaffold to receive these gates** — inert until registered.
+- `git-precommit-gate` — a **native** git `pre-commit` hook so commit gating
+  fires on *every* commit path (terminal, IDE, Claude Code Bash tool), not only
+  when a commit goes through Claude Code. The tracked hook lives in `.githooks/`
+  (versioned with the project, so it survives clones) and shells
+  `scripts/commit_gate.py --native`, running the same `.scaffold/gates.json` set
+  in file order and aborting the commit on the first failing gate — a gate whose
+  command is missing from PATH blocks rather than being skipped. The hook is
+  wired by setting the project-local `core.hooksPath` to `.githooks/`; the
+  scaffold never writes into `.git/hooks/`. **`core.hooksPath` is per-clone**:
+  the hook file is committed, but each fresh clone needs the one-time config —
+  re-run `scaffold install` / `scaffold update` in the clone (or run
+  `git config --local core.hooksPath .githooks` manually) to activate it.
+  Wiring is idempotent (re-run adds no duplicate, does not re-write a correct
+  config) and **never clobbers a foreign `core.hooksPath`**: if it already
+  points at a directory the scaffold did not author, the conflict is reported
+  and the value left in place. Not a git work tree → **BLOCKED** (`git init`
+  remedy — same gate mechanism as `github-init`); `check`/`list` report it
+  read-only and write nothing. Bypassable with `git commit --no-verify` (a
+  local developer gate, not a security control; server-side/CI enforcement is a
+  separate layer).
 
 **Plugin components** — reconciled against
 `~/.claude/plugins/installed_plugins.json`, installed via `claude plugin install`:

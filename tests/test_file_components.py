@@ -108,6 +108,128 @@ def test_commit_gate_allows_on_pass(project_dir):
 
 
 # --------------------------------------------------------------------------- #
+# enforcement-hooks: shared gate runner (run_all_gates)
+# --------------------------------------------------------------------------- #
+def _write_gates(project_dir, gates):
+    (project_dir / ".scaffold").mkdir(exist_ok=True)
+    (project_dir / ".scaffold" / "gates.json").write_text(
+        json.dumps({"gates": gates}), encoding="utf-8"
+    )
+
+
+def test_run_all_gates_pass(project_dir):
+    """All gates passing → None (both hooks share this runner)."""
+    _write_gates(project_dir, [{"name": "tests", "cmd": ["true"], "stopReason": "b"}])
+    assert commit_gate.run_all_gates(project_dir) is None
+
+
+def test_run_all_gates_first_failing(project_dir):
+    """The first non-zero gate's block is returned; later gates never run."""
+    _write_gates(
+        project_dir,
+        [
+            {"name": "tests", "cmd": ["false"], "stopReason": "tests boom"},
+            {"name": "lint:specs", "cmd": ["true"], "stopReason": "specs boom"},
+        ],
+    )
+    assert commit_gate.run_all_gates(project_dir) == {
+        "continue": False,
+        "stopReason": "tests boom",
+    }
+
+
+def test_run_all_gates_missing_command(project_dir):
+    """A gate whose command is absent from PATH blocks (not silently skipped)."""
+    _write_gates(
+        project_dir,
+        [{"name": "analyze:sf", "cmd": ["definitely-not-a-real-binary-xyz"],
+          "stopReason": "sf boom"}],
+    )
+    result = commit_gate.run_all_gates(project_dir)
+    assert result["continue"] is False
+    assert "analyze:sf" in result["stopReason"]
+
+
+# --------------------------------------------------------------------------- #
+# enforcement-hooks: PreToolUse defers when the native git hook is wired
+# --------------------------------------------------------------------------- #
+def _wire_native_hook(project_dir):
+    """Make native_hook_active() true: tracked hook file + core.hooksPath set."""
+    hooks = project_dir / ".githooks"
+    hooks.mkdir(exist_ok=True)
+    (hooks / "pre-commit").write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(project_dir), "init", "-q"], check=True,
+        capture_output=True, text=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(project_dir), "config", "--local",
+         "core.hooksPath", ".githooks"],
+        check=True, capture_output=True, text=True,
+    )
+
+
+def test_evaluate_defers_when_native_hook_active(project_dir):
+    """Native hook wired → PreToolUse returns None even for a FAILING gate.
+
+    Proves the gate set does not run twice per in-session commit: the native
+    git hook owns gating, so PreToolUse defers rather than re-running it."""
+    _wire_native_hook(project_dir)
+    _write_gates(project_dir, [{"name": "tests", "cmd": ["false"], "stopReason": "boom"}])
+    assert commit_gate.evaluate(project_dir, {"command": "git commit -m x"}) is None
+
+
+def test_evaluate_runs_when_native_hook_absent(project_dir):
+    """No native hook → PreToolUse still gates (blocks a failing gate)."""
+    _write_gates(project_dir, [{"name": "tests", "cmd": ["false"], "stopReason": "boom"}])
+    assert commit_gate.evaluate(project_dir, {"command": "git commit -m x"}) == {
+        "continue": False,
+        "stopReason": "boom",
+    }
+
+
+def test_native_hook_active_false_without_hookspath(project_dir):
+    """Hook file present but core.hooksPath unset → not active (would not fire)."""
+    (project_dir / ".githooks").mkdir(exist_ok=True)
+    (project_dir / ".githooks" / "pre-commit").write_text("x\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(project_dir), "init", "-q"], check=True,
+        capture_output=True, text=True,
+    )
+    assert commit_gate.native_hook_active(project_dir) is False
+
+
+# --------------------------------------------------------------------------- #
+# enforcement-hooks: native git pre-commit mode (exit code)
+# --------------------------------------------------------------------------- #
+def test_native_main_pass_returns_zero(project_dir):
+    _write_gates(project_dir, [{"name": "tests", "cmd": ["true"], "stopReason": "b"}])
+    assert commit_gate.native_main(project_dir) == 0
+
+
+def test_native_main_failing_gate_returns_nonzero(project_dir, capsys):
+    _write_gates(project_dir, [{"name": "tests", "cmd": ["false"], "stopReason": "boom"}])
+    assert commit_gate.native_main(project_dir) == 1
+    assert "boom" in capsys.readouterr().err
+
+
+def test_native_main_missing_command_returns_nonzero(project_dir, capsys):
+    _write_gates(
+        project_dir,
+        [{"name": "analyze:sf", "cmd": ["definitely-not-a-real-binary-xyz"],
+          "stopReason": "sf boom"}],
+    )
+    assert commit_gate.native_main(project_dir) == 1
+    assert "analyze:sf" in capsys.readouterr().err
+
+
+def test_main_native_flag_dispatches(project_dir):
+    """`--native <dir>` runs the exit-code path, leaving JSON path for Claude Code."""
+    _write_gates(project_dir, [{"name": "tests", "cmd": ["false"], "stopReason": "boom"}])
+    assert commit_gate.main(["commit_gate.py", "--native", str(project_dir)]) == 1
+
+
+# --------------------------------------------------------------------------- #
 # enforcement-hooks: idempotent wiring
 # --------------------------------------------------------------------------- #
 def test_hook_wiring_idempotent(project_dir):
