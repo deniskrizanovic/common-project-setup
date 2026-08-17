@@ -1,0 +1,40 @@
+#!/usr/bin/env python3
+"""Native git pre-commit hook — runs the shared commit-gate set.
+
+Wired via `core.hooksPath` at the tracked `.githooks/` directory, so it fires on
+every commit path (terminal, IDE, Claude Code Bash tool), not only when a commit
+goes through Claude Code. It shells the same runner as the Claude Code
+`PreToolUse` commit-gate (`scripts/commit_gate.py --native`), which runs the
+gates in `.scaffold/gates.json` in file order and aborts the commit (non-zero
+exit) on the first failing gate — so the two paths cannot drift.
+
+Provenance: scaffold component `git-precommit-gate`.
+"""
+from __future__ import annotations
+
+import subprocess
+import sys
+from pathlib import Path
+
+
+def repo_root() -> Path:
+    """Top level of the work tree git is committing in."""
+    out = subprocess.check_output(
+        ["git", "rev-parse", "--show-toplevel"], text=True
+    ).strip()
+    return Path(out)
+
+
+def main() -> int:
+    root = repo_root()
+    runner = root / "scripts" / "commit_gate.py"
+    if not runner.is_file():
+        # No gate runner installed — do not block the commit.
+        return 0
+    return subprocess.run(
+        [sys.executable, str(runner), "--native", str(root)]
+    ).returncode
+
+
+if __name__ == "__main__":
+    sys.exit(main())

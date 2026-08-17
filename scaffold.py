@@ -882,6 +882,21 @@ def build_registry() -> list:
                 remedy=static_analysis_remedy,
             ),
         ),
+        FileComponent(
+            id="git-precommit-gate",
+            version=1,
+            description="Native git pre-commit hook (core.hooksPath) running the "
+                        "shared gate set for terminal/IDE commits",
+            # No tracked-file copy: the writer writes the hook and wires
+            # core.hooksPath, so its drift is satisfied()-only (BLOCKED/MISSING/OK).
+            files=[],
+            # OK once the tracked hook exists and core.hooksPath points at it.
+            satisfied=git_precommit_gate_satisfied,
+            writer=install_git_precommit_gate,
+            # No git work tree → BLOCKED + printed remedy; there is no repo to
+            # wire core.hooksPath into.
+            needs_git=True,
+        ),
         *_plugin_components(),
         *_skill_components(),
     ]
@@ -1007,6 +1022,96 @@ def has_origin_remote(project_root: Path, _text: Optional[str] = None) -> bool:
     except (subprocess.CalledProcessError, FileNotFoundError, OSError):
         return False
     return bool(out)
+
+
+# --------------------------------------------------------------------------- #
+# git-precommit-gate: native git pre-commit hook wiring
+# --------------------------------------------------------------------------- #
+# Tracked hooks directory `core.hooksPath` points at, versioned with the project
+# so the hook survives clones (a plain `.git/hooks/` hook does not). The scaffold
+# only ever sets `core.hooksPath` to this value.
+SCAFFOLD_HOOKS_DIR = ".githooks"
+# The tracked hook template + its dest, mirroring a FileComponent `files` pair.
+PRECOMMIT_HOOK_SRC = "githooks/pre-commit"
+PRECOMMIT_HOOK_DEST = f"{SCAFFOLD_HOOKS_DIR}/pre-commit"
+
+
+def git_config_get(project_root: Path, key: str) -> Optional[str]:
+    """The project-local git config value for `key`, or None when unset.
+
+    Reads `--local` only so a value inherited from global/system config does not
+    read as project state. Absent git / unset key → None."""
+    try:
+        out = subprocess.check_output(
+            ["git", "-C", str(project_root), "config", "--local", "--get", key],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+        return None
+    return out or None
+
+
+def git_config_set(project_root: Path, key: str, value: str) -> None:
+    """Set a project-local git config value."""
+    subprocess.run(
+        ["git", "-C", str(project_root), "config", "--local", key, value],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _precommit_hook_installed(project_root: Path) -> bool:
+    """True when the tracked pre-commit hook exists and is executable."""
+    hook = project_root / PRECOMMIT_HOOK_DEST
+    return hook.is_file() and os.access(hook, os.X_OK)
+
+
+def git_precommit_gate_satisfied(
+    project_root: Path, _text: Optional[str] = None
+) -> bool:
+    """OK when the tracked hook is installed AND `core.hooksPath` points at it.
+
+    Both halves must hold: a hook with no `core.hooksPath` never fires, and a
+    `core.hooksPath` with no hook file gates nothing. Accepts the
+    `(project_root, text=None)` satisfied() seam; `_text` is ignored."""
+    return (
+        _precommit_hook_installed(project_root)
+        and git_config_get(project_root, "core.hooksPath") == SCAFFOLD_HOOKS_DIR
+    )
+
+
+def install_git_precommit_gate(project_root: Path, out=sys.stdout) -> None:
+    """Write the tracked pre-commit hook and wire `core.hooksPath` idempotently.
+
+    Always (re)writes the tracked hook file executable — it is versioned content,
+    safe to refresh. Then sets project-local `core.hooksPath` only when it is
+    unset or already the scaffold's dir; a `core.hooksPath` the scaffold did not
+    author is reported as a conflict and left untouched (clobbering a team's hook
+    config is destructive). Writes no outward state and runs no commit.
+    """
+    src = TEMPLATES_DIR / PRECOMMIT_HOOK_SRC
+    dest = project_root / PRECOMMIT_HOOK_DEST
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(src, dest)
+    dest.chmod(0o755)
+
+    current = git_config_get(project_root, "core.hooksPath")
+    if current is None or current == SCAFFOLD_HOOKS_DIR:
+        if current != SCAFFOLD_HOOKS_DIR:
+            git_config_set(project_root, "core.hooksPath", SCAFFOLD_HOOKS_DIR)
+            print(f"  wired core.hooksPath -> {SCAFFOLD_HOOKS_DIR}; "
+                  "pre-commit hook installed.", file=out)
+        else:
+            print("  pre-commit hook installed; core.hooksPath already set.",
+                  file=out)
+        return
+    # Foreign core.hooksPath — do not clobber; report the conflict.
+    print(f"  ! core.hooksPath is set to {current!r}, which the scaffold did not "
+          f"author; leaving it in place. The pre-commit gate will not run until "
+          f"core.hooksPath is {SCAFFOLD_HOOKS_DIR!r}. Reconcile manually.",
+          file=out)
 
 
 # --------------------------------------------------------------------------- #
