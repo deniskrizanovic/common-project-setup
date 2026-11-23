@@ -78,6 +78,12 @@ a root and install normally on a non-OpenSpec repo.
   re-install) to receive this strengthened gate** — the check is inert until the
   updated `lint_specs.py` is installed, so a stale copy still passes on
   invented or mistyped test names.
+- `scaffold-retro` — the `/scaffold-retro` Claude Code skill at
+  `.claude/skills/scaffold-retro/SKILL.md`. Run in a provisioned project, it
+  reports local changes worth promoting back into this repo (see
+  [Retro workflow](#retro-workflow)). Tracked like any file component, so a
+  local edit to the skill shows as MODIFIED. Needs no OpenSpec root and no git
+  repo.
 - `github-init` — **print-only** nag to create a GitHub `origin` remote. Tracks no
   files, records no hash, takes no outward action. Detection keys on the git
   `origin` remote: not a git repository → **BLOCKED** (`git init` remedy; needs a
@@ -150,6 +156,27 @@ A project extends/overrides via `.scaffold/skills.yaml` (a `skills:`-only
 manifest fragment; same-name entries replace the base, new names extend). EXTRA
 skills are **reported only, never removed**. If the `npx skills` CLI is absent,
 the exact commands are printed instead of failing the run.
+
+## Retro workflow
+
+Child projects improve scaffold components in place. The retro harvests those
+improvements:
+
+1. In the child project, run `/scaffold-retro`. The skill compares the project
+   with the scaffold: modified tracked files (diffed against the pristine
+   template at the recorded `source_sha`), local gates, hooks and scripts,
+   wishlist overrides, config rules, and recurring patterns in `CLAUDE.md` and
+   the OpenSpec archive.
+2. Review the report at `.scaffold/retro/retro-<date>.md`. Each candidate has
+   evidence, benefits, risks, a `promote` / `adapt` / `keep-local`
+   recommendation, and a suggested change name. Secret redaction is heuristic,
+   so read it before sharing.
+3. In `common-project-setup`, run `/opsx:propose` with the candidates you chose.
+
+The skill only writes that report. It does not edit project or scaffold files,
+and it takes no outward action (no issues, PRs, or pushes). If the scaffold
+source cannot be reached, modified files are listed by path only and every
+other category still runs.
 
 ## Source of truth: `scaffold_base/manifest.yaml`
 

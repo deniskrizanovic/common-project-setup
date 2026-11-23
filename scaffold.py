@@ -856,6 +856,16 @@ def build_registry() -> list:
             ],
         ),
         FileComponent(
+            id="scaffold-retro",
+            version=1,
+            description="Read-only /scaffold-retro skill: reports local changes "
+                        "worth promoting back into common-project-setup",
+            files=[
+                (".claude/skills/scaffold-retro/SKILL.md",
+                 ".claude/skills/scaffold-retro/SKILL.md"),
+            ],
+        ),
+        FileComponent(
             id="github-init",
             version=1,
             description="Nag to create a GitHub origin remote (print-only, needs_git)",
